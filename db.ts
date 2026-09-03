@@ -1,0 +1,793 @@
+// ── SQLite data layer ───────────────────────────────────────────────────────
+//
+// Replaces the previous single-JSON-file store (data/db.json), which parsed and
+// rewrote the whole document on every mutation. That was safe only by accident:
+// Node's single thread meant a synchronous read-modify-write could not be
+// interleaved. One `await` between the read and the write, or a second process
+// (PM2 cluster mode), and unrelated records get clobbered. It also rewrote ~5 MB
+// per single-channel edit and offered no way to compare-and-swap.
+//
+// Every write here is a scoped statement, in a transaction where more than one
+// statement is involved.
+//
+// Conventions, kept deliberately boring:
+//   - Columns are snake_case; the TypeScript objects stay camelCase. Each table
+//     has an explicit `rowTo*` mapper below — no automatic name conversion.
+//   - Lists that need to keep their order (playlist categories, changelog
+//     entries) are stored as JSON text in a single column.
+//   - `version` is written but not yet enforced; optimistic concurrency
+//     (If-Match / 409) arrives in a later phase.
+
+import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "crypto";
+import path from "path";
+import fs from "fs";
+
+const DATA_DIR = path.join(process.cwd(), "data");
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// Both paths can be overridden so tests and one-off checks can run against a
+// throwaway database instead of the live one.
+export const DB_PATH = process.env.M3U4ME_DB_PATH || path.join(DATA_DIR, "m3u4me.db");
+export const LEGACY_JSON_PATH =
+  process.env.M3U4ME_LEGACY_JSON || path.join(DATA_DIR, "db.json");
+
+// ── Types (shared with server.ts; frontend copy lives in src/apiClient.ts) ──
+
+export interface Playlist {
+  id: string;
+  name: string;
+  userId: string;
+  categories: string[];
+  exportId: string;
+  shortId: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface Channel {
+  id: string;
+  playlistId: string;
+  name: string;
+  url: string;
+  logo: string | null;
+  tvgId: string | null;
+  category: string;
+  order: number;
+  isHidden?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface EpgSource {
+  id: string;
+  name: string;
+  url: string;
+  type: "xml" | "xtream";
+  xtreamCredentials?: { username: string; password: string };
+  refreshIntervalHours: number;
+  lastFetched: number | null;
+  lastFetchError: string | null;
+  channelCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ChannelPoolSource {
+  id: string;
+  name: string;
+  type: "xtream" | "playlist-url" | "playlist-file";
+  url: string | null;
+  xtreamCredentials?: { username: string; password: string };
+  refreshIntervalHours: number;
+  lastFetched: number | null;
+  lastFetchError: string | null;
+  channelCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ChannelPoolEntry {
+  id: string;
+  sourceId: string;
+  name: string;
+  url: string;
+  logo: string | null;
+  category: string;
+  tvgId: string | null;
+}
+
+export interface ChannelPoolChangeLog {
+  id: string;
+  sourceId: string;
+  sourceName: string;
+  timestamp: number;
+  added: { name: string; category: string }[];
+  removed: { name: string; category: string }[];
+  renamed: { oldName: string; newName: string; category: string }[];
+}
+
+// ── Connection and schema ───────────────────────────────────────────────────
+
+export const db = new DatabaseSync(DB_PATH);
+
+// WAL lets readers carry on while a write is in flight — the reason multiple
+// devices can hit this concurrently at all.
+db.exec("PRAGMA journal_mode = WAL");
+db.exec("PRAGMA foreign_keys = ON");
+// Wait rather than throw SQLITE_BUSY if another write holds the lock.
+db.exec("PRAGMA busy_timeout = 5000");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS playlists (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    categories  TEXT NOT NULL DEFAULT '[]',
+    export_id   TEXT NOT NULL UNIQUE,
+    short_id    INTEGER NOT NULL UNIQUE,
+    version     INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS channels (
+    id          TEXT PRIMARY KEY,
+    playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    logo        TEXT,
+    tvg_id      TEXT,
+    category    TEXT NOT NULL,
+    sort_order  INTEGER NOT NULL,
+    is_hidden   INTEGER NOT NULL DEFAULT 0,
+    version     INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS epg_sources (
+    id                    TEXT PRIMARY KEY,
+    name                  TEXT NOT NULL,
+    url                   TEXT NOT NULL,
+    type                  TEXT NOT NULL,
+    xtream_username       TEXT,
+    xtream_password       TEXT,
+    refresh_interval_hours INTEGER NOT NULL DEFAULT 12,
+    last_fetched          INTEGER,
+    last_fetch_error      TEXT,
+    channel_count         INTEGER NOT NULL DEFAULT 0,
+    version               INTEGER NOT NULL DEFAULT 1,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS channel_pool_sources (
+    id                    TEXT PRIMARY KEY,
+    name                  TEXT NOT NULL,
+    type                  TEXT NOT NULL,
+    url                   TEXT,
+    xtream_username       TEXT,
+    xtream_password       TEXT,
+    refresh_interval_hours INTEGER NOT NULL DEFAULT 24,
+    last_fetched          INTEGER,
+    last_fetch_error      TEXT,
+    channel_count         INTEGER NOT NULL DEFAULT 0,
+    version               INTEGER NOT NULL DEFAULT 1,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS channel_pool_entries (
+    id        TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES channel_pool_sources(id) ON DELETE CASCADE,
+    name      TEXT NOT NULL,
+    url       TEXT NOT NULL,
+    logo      TEXT,
+    category  TEXT NOT NULL,
+    tvg_id    TEXT
+  );
+
+  -- Changelogs have no foreign key so that pruning/retention is driven purely by
+  -- timestamp. Deleting a source still clears its logs, via deleteBySource().
+  CREATE TABLE IF NOT EXISTS channel_pool_change_logs (
+    id          TEXT PRIMARY KEY,
+    source_id   TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    timestamp   INTEGER NOT NULL,
+    added       TEXT NOT NULL DEFAULT '[]',
+    removed     TEXT NOT NULL DEFAULT '[]',
+    renamed     TEXT NOT NULL DEFAULT '[]'
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_playlists_user      ON playlists(user_id);
+  CREATE INDEX IF NOT EXISTS idx_channels_playlist   ON channels(playlist_id, sort_order);
+  CREATE INDEX IF NOT EXISTS idx_channels_tvg        ON channels(tvg_id);
+  CREATE INDEX IF NOT EXISTS idx_pool_entries_source ON channel_pool_entries(source_id);
+  CREATE INDEX IF NOT EXISTS idx_pool_entries_cat    ON channel_pool_entries(source_id, category);
+  CREATE INDEX IF NOT EXISTS idx_pool_logs_source    ON channel_pool_change_logs(source_id, timestamp);
+`);
+
+// ── Row mappers ─────────────────────────────────────────────────────────────
+
+type Row = Record<string, any>;
+
+const toBool = (v: any) => v === 1 || v === true;
+const fromBool = (v: any) => (v ? 1 : 0);
+const parseJson = <T>(text: any, fallback: T): T => {
+  try {
+    return text ? (JSON.parse(text) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+function rowToPlaylist(r: Row): Playlist {
+  return {
+    id: r.id,
+    name: r.name,
+    userId: r.user_id,
+    categories: parseJson<string[]>(r.categories, []),
+    exportId: r.export_id,
+    shortId: r.short_id,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function rowToChannel(r: Row): Channel {
+  return {
+    id: r.id,
+    playlistId: r.playlist_id,
+    name: r.name,
+    url: r.url,
+    logo: r.logo ?? null,
+    tvgId: r.tvg_id ?? null,
+    category: r.category,
+    order: r.sort_order,
+    isHidden: toBool(r.is_hidden),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function credsFrom(r: Row) {
+  return r.xtream_username != null
+    ? { username: r.xtream_username, password: r.xtream_password ?? "" }
+    : undefined;
+}
+
+function rowToEpgSource(r: Row): EpgSource {
+  const s: EpgSource = {
+    id: r.id,
+    name: r.name,
+    url: r.url,
+    type: r.type,
+    refreshIntervalHours: r.refresh_interval_hours,
+    lastFetched: r.last_fetched ?? null,
+    lastFetchError: r.last_fetch_error ?? null,
+    channelCount: r.channel_count,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+  const creds = credsFrom(r);
+  if (creds) s.xtreamCredentials = creds;
+  return s;
+}
+
+function rowToPoolSource(r: Row): ChannelPoolSource {
+  const s: ChannelPoolSource = {
+    id: r.id,
+    name: r.name,
+    type: r.type,
+    url: r.url ?? null,
+    refreshIntervalHours: r.refresh_interval_hours,
+    lastFetched: r.last_fetched ?? null,
+    lastFetchError: r.last_fetch_error ?? null,
+    channelCount: r.channel_count,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+  const creds = credsFrom(r);
+  if (creds) s.xtreamCredentials = creds;
+  return s;
+}
+
+function rowToPoolEntry(r: Row): ChannelPoolEntry {
+  return {
+    id: r.id,
+    sourceId: r.source_id,
+    name: r.name,
+    url: r.url,
+    logo: r.logo ?? null,
+    category: r.category,
+    tvgId: r.tvg_id ?? null,
+  };
+}
+
+function rowToChangeLog(r: Row): ChannelPoolChangeLog {
+  return {
+    id: r.id,
+    sourceId: r.source_id,
+    sourceName: r.source_name,
+    timestamp: r.timestamp,
+    added: parseJson(r.added, []),
+    removed: parseJson(r.removed, []),
+    renamed: parseJson(r.renamed, []),
+  };
+}
+
+// ── Transactions ────────────────────────────────────────────────────────────
+
+/**
+ * Runs `fn` inside a single transaction. Any throw rolls the whole thing back,
+ * so a multi-statement write (e.g. reordering every channel in a playlist) can
+ * never land half-applied the way the old whole-file rewrite could.
+ */
+export function inTransaction<T>(fn: () => T): T {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* rollback of an already-aborted transaction is not itself an error */
+    }
+    throw err;
+  }
+}
+
+// ── Playlists ───────────────────────────────────────────────────────────────
+
+export const playlists = {
+  all(): Playlist[] {
+    return db.prepare("SELECT * FROM playlists ORDER BY short_id").all().map(rowToPlaylist);
+  },
+  byId(id: string): Playlist | null {
+    const r = db.prepare("SELECT * FROM playlists WHERE id = ?").get(id);
+    return r ? rowToPlaylist(r as Row) : null;
+  },
+  byShortId(shortId: number): Playlist | null {
+    const r = db.prepare("SELECT * FROM playlists WHERE short_id = ?").get(shortId);
+    return r ? rowToPlaylist(r as Row) : null;
+  },
+  byExportId(exportId: string): Playlist | null {
+    const r = db.prepare("SELECT * FROM playlists WHERE export_id = ?").get(exportId);
+    return r ? rowToPlaylist(r as Row) : null;
+  },
+  nextShortId(): number {
+    const r = db.prepare("SELECT COALESCE(MAX(short_id), 0) + 1 AS next FROM playlists").get() as Row;
+    return r.next;
+  },
+  insert(p: Playlist): void {
+    db.prepare(
+      `INSERT INTO playlists (id, user_id, name, categories, export_id, short_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      p.id,
+      p.userId,
+      p.name,
+      JSON.stringify(p.categories ?? []),
+      p.exportId,
+      p.shortId,
+      p.createdAt,
+      p.updatedAt,
+    );
+  },
+  update(id: string, patch: Partial<Playlist>): Playlist | null {
+    const current = this.byId(id);
+    if (!current) return null;
+    const next = { ...current, ...patch, updatedAt: Date.now() };
+    db.prepare(
+      `UPDATE playlists
+          SET name = ?, categories = ?, updated_at = ?, version = version + 1
+        WHERE id = ?`,
+    ).run(next.name, JSON.stringify(next.categories ?? []), next.updatedAt, id);
+    return next;
+  },
+  delete(id: string): void {
+    // channels cascade via the foreign key
+    db.prepare("DELETE FROM playlists WHERE id = ?").run(id);
+  },
+};
+
+// ── Channels ────────────────────────────────────────────────────────────────
+
+export const channels = {
+  all(): Channel[] {
+    return db.prepare("SELECT * FROM channels").all().map(rowToChannel);
+  },
+  byPlaylist(playlistId: string): Channel[] {
+    return db
+      .prepare("SELECT * FROM channels WHERE playlist_id = ? ORDER BY sort_order")
+      .all(playlistId)
+      .map(rowToChannel);
+  },
+  byId(id: string): Channel | null {
+    const r = db.prepare("SELECT * FROM channels WHERE id = ?").get(id);
+    return r ? rowToChannel(r as Row) : null;
+  },
+  maxOrder(playlistId: string): number {
+    const r = db
+      .prepare("SELECT COALESCE(MAX(sort_order), 0) AS mx FROM channels WHERE playlist_id = ?")
+      .get(playlistId) as Row;
+    return r.mx;
+  },
+  countByPlaylist(playlistId: string): number {
+    const r = db
+      .prepare("SELECT COUNT(*) AS n FROM channels WHERE playlist_id = ?")
+      .get(playlistId) as Row;
+    return r.n;
+  },
+  insert(c: Channel): void {
+    db.prepare(
+      `INSERT INTO channels
+         (id, playlist_id, name, url, logo, tvg_id, category, sort_order, is_hidden, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      c.id,
+      c.playlistId,
+      c.name,
+      c.url,
+      c.logo ?? null,
+      c.tvgId ?? null,
+      c.category,
+      c.order,
+      fromBool(c.isHidden),
+      c.createdAt,
+      c.updatedAt,
+    );
+  },
+  insertMany(list: Channel[]): void {
+    const stmt = db.prepare(
+      `INSERT INTO channels
+         (id, playlist_id, name, url, logo, tvg_id, category, sort_order, is_hidden, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const c of list) {
+      stmt.run(
+        c.id,
+        c.playlistId,
+        c.name,
+        c.url,
+        c.logo ?? null,
+        c.tvgId ?? null,
+        c.category,
+        c.order,
+        fromBool(c.isHidden),
+        c.createdAt,
+        c.updatedAt,
+      );
+    }
+  },
+  update(id: string, patch: Partial<Channel>): Channel | null {
+    const current = this.byId(id);
+    if (!current) return null;
+    const next = { ...current, ...patch, updatedAt: Date.now() };
+    db.prepare(
+      `UPDATE channels
+          SET name = ?, url = ?, logo = ?, tvg_id = ?, category = ?,
+              sort_order = ?, is_hidden = ?, updated_at = ?, version = version + 1
+        WHERE id = ?`,
+    ).run(
+      next.name,
+      next.url,
+      next.logo ?? null,
+      next.tvgId ?? null,
+      next.category,
+      next.order,
+      fromBool(next.isHidden),
+      next.updatedAt,
+      id,
+    );
+    return next;
+  },
+  setOrder(id: string, order: number, updatedAt = Date.now()): void {
+    db.prepare(
+      "UPDATE channels SET sort_order = ?, updated_at = ?, version = version + 1 WHERE id = ?",
+    ).run(order, updatedAt, id);
+  },
+  delete(id: string): void {
+    db.prepare("DELETE FROM channels WHERE id = ?").run(id);
+  },
+  deleteMany(ids: string[]): number {
+    if (ids.length === 0) return 0;
+    const stmt = db.prepare("DELETE FROM channels WHERE id = ?");
+    let n = 0;
+    for (const id of ids) n += stmt.run(id).changes as number;
+    return n;
+  },
+  deleteByPlaylist(playlistId: string): void {
+    db.prepare("DELETE FROM channels WHERE playlist_id = ?").run(playlistId);
+  },
+  distinctTvgIds(): string[] {
+    return db
+      .prepare("SELECT DISTINCT tvg_id FROM channels WHERE tvg_id IS NOT NULL AND tvg_id != ''")
+      .all()
+      .map((r: any) => r.tvg_id);
+  },
+};
+
+// ── EPG sources ─────────────────────────────────────────────────────────────
+
+export const epgSources = {
+  all(): EpgSource[] {
+    return db.prepare("SELECT * FROM epg_sources ORDER BY created_at").all().map(rowToEpgSource);
+  },
+  byId(id: string): EpgSource | null {
+    const r = db.prepare("SELECT * FROM epg_sources WHERE id = ?").get(id);
+    return r ? rowToEpgSource(r as Row) : null;
+  },
+  insert(s: EpgSource): void {
+    db.prepare(
+      `INSERT INTO epg_sources
+         (id, name, url, type, xtream_username, xtream_password, refresh_interval_hours,
+          last_fetched, last_fetch_error, channel_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      s.id,
+      s.name,
+      s.url,
+      s.type,
+      s.xtreamCredentials?.username ?? null,
+      s.xtreamCredentials?.password ?? null,
+      s.refreshIntervalHours,
+      s.lastFetched ?? null,
+      s.lastFetchError ?? null,
+      s.channelCount,
+      s.createdAt,
+      s.updatedAt,
+    );
+  },
+  update(id: string, patch: Partial<EpgSource>): EpgSource | null {
+    const current = this.byId(id);
+    if (!current) return null;
+    const next = { ...current, ...patch, updatedAt: Date.now() };
+    db.prepare(
+      `UPDATE epg_sources
+          SET name = ?, url = ?, type = ?, xtream_username = ?, xtream_password = ?,
+              refresh_interval_hours = ?, last_fetched = ?, last_fetch_error = ?,
+              channel_count = ?, updated_at = ?, version = version + 1
+        WHERE id = ?`,
+    ).run(
+      next.name,
+      next.url,
+      next.type,
+      next.xtreamCredentials?.username ?? null,
+      next.xtreamCredentials?.password ?? null,
+      next.refreshIntervalHours,
+      next.lastFetched ?? null,
+      next.lastFetchError ?? null,
+      next.channelCount,
+      next.updatedAt,
+      id,
+    );
+    return next;
+  },
+  delete(id: string): void {
+    db.prepare("DELETE FROM epg_sources WHERE id = ?").run(id);
+  },
+};
+
+// ── Channel pool sources ────────────────────────────────────────────────────
+
+export const poolSources = {
+  all(): ChannelPoolSource[] {
+    return db
+      .prepare("SELECT * FROM channel_pool_sources ORDER BY created_at")
+      .all()
+      .map(rowToPoolSource);
+  },
+  byId(id: string): ChannelPoolSource | null {
+    const r = db.prepare("SELECT * FROM channel_pool_sources WHERE id = ?").get(id);
+    return r ? rowToPoolSource(r as Row) : null;
+  },
+  insert(s: ChannelPoolSource): void {
+    db.prepare(
+      `INSERT INTO channel_pool_sources
+         (id, name, type, url, xtream_username, xtream_password, refresh_interval_hours,
+          last_fetched, last_fetch_error, channel_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      s.id,
+      s.name,
+      s.type,
+      s.url ?? null,
+      s.xtreamCredentials?.username ?? null,
+      s.xtreamCredentials?.password ?? null,
+      s.refreshIntervalHours,
+      s.lastFetched ?? null,
+      s.lastFetchError ?? null,
+      s.channelCount,
+      s.createdAt,
+      s.updatedAt,
+    );
+  },
+  update(id: string, patch: Partial<ChannelPoolSource>): ChannelPoolSource | null {
+    const current = this.byId(id);
+    if (!current) return null;
+    const next = { ...current, ...patch, updatedAt: Date.now() };
+    db.prepare(
+      `UPDATE channel_pool_sources
+          SET name = ?, type = ?, url = ?, xtream_username = ?, xtream_password = ?,
+              refresh_interval_hours = ?, last_fetched = ?, last_fetch_error = ?,
+              channel_count = ?, updated_at = ?, version = version + 1
+        WHERE id = ?`,
+    ).run(
+      next.name,
+      next.type,
+      next.url ?? null,
+      next.xtreamCredentials?.username ?? null,
+      next.xtreamCredentials?.password ?? null,
+      next.refreshIntervalHours,
+      next.lastFetched ?? null,
+      next.lastFetchError ?? null,
+      next.channelCount,
+      next.updatedAt,
+      id,
+    );
+    return next;
+  },
+  delete(id: string): void {
+    // Entries cascade via the foreign key; changelogs are cleared explicitly by
+    // the caller (see the DELETE route) to match the previous behaviour.
+    db.prepare("DELETE FROM channel_pool_sources WHERE id = ?").run(id);
+  },
+};
+
+// ── Channel pool entries ────────────────────────────────────────────────────
+
+export const poolEntries = {
+  bySource(sourceId: string): ChannelPoolEntry[] {
+    return db
+      .prepare("SELECT * FROM channel_pool_entries WHERE source_id = ?")
+      .all(sourceId)
+      .map(rowToPoolEntry);
+  },
+  countBySource(sourceId: string): number {
+    const r = db
+      .prepare("SELECT COUNT(*) AS n FROM channel_pool_entries WHERE source_id = ?")
+      .get(sourceId) as Row;
+    return r.n;
+  },
+  categoriesBySource(sourceId: string): string[] {
+    return db
+      .prepare(
+        "SELECT DISTINCT category FROM channel_pool_entries WHERE source_id = ? ORDER BY category",
+      )
+      .all(sourceId)
+      .map((r: any) => r.category);
+  },
+  replaceForSource(sourceId: string, list: ChannelPoolEntry[]): void {
+    db.prepare("DELETE FROM channel_pool_entries WHERE source_id = ?").run(sourceId);
+    const stmt = db.prepare(
+      `INSERT INTO channel_pool_entries (id, source_id, name, url, logo, category, tvg_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const e of list) {
+      stmt.run(e.id, sourceId, e.name, e.url, e.logo ?? null, e.category, e.tvgId ?? null);
+    }
+  },
+  deleteBySource(sourceId: string): void {
+    db.prepare("DELETE FROM channel_pool_entries WHERE source_id = ?").run(sourceId);
+  },
+};
+
+// ── Channel pool changelogs ─────────────────────────────────────────────────
+
+export const poolChangeLogs = {
+  all(): ChannelPoolChangeLog[] {
+    return db
+      .prepare("SELECT * FROM channel_pool_change_logs ORDER BY timestamp DESC")
+      .all()
+      .map(rowToChangeLog);
+  },
+  insert(log: ChannelPoolChangeLog): void {
+    db.prepare(
+      `INSERT INTO channel_pool_change_logs
+         (id, source_id, source_name, timestamp, added, removed, renamed)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      log.id,
+      log.sourceId,
+      log.sourceName,
+      log.timestamp,
+      JSON.stringify(log.added ?? []),
+      JSON.stringify(log.removed ?? []),
+      JSON.stringify(log.renamed ?? []),
+    );
+  },
+  deleteBySource(sourceId: string): void {
+    db.prepare("DELETE FROM channel_pool_change_logs WHERE source_id = ?").run(sourceId);
+  },
+  /**
+   * Matches the previous 90-day pruning behaviour, which kept only logs with
+   * `timestamp > cutoff` — hence `<=` here rather than `<`.
+   */
+  pruneOlderThan(cutoff: number): number {
+    return db
+      .prepare("DELETE FROM channel_pool_change_logs WHERE timestamp <= ?")
+      .run(cutoff).changes as number;
+  },
+};
+
+// ── One-time migration from data/db.json ────────────────────────────────────
+
+/**
+ * Copies data/db.json into SQLite the first time the server boots after the
+ * switch. Runs only when the JSON file exists and the database is still empty,
+ * so it is safe to call unconditionally. The JSON file is left untouched — it
+ * becomes the rollback copy.
+ */
+export function migrateFromJson(): { migrated: boolean; counts?: Record<string, number> } {
+  if (!fs.existsSync(LEGACY_JSON_PATH)) return { migrated: false };
+
+  const existing = db.prepare("SELECT COUNT(*) AS n FROM playlists").get() as Row;
+  const existingSources = db.prepare("SELECT COUNT(*) AS n FROM channel_pool_sources").get() as Row;
+  if (existing.n > 0 || existingSources.n > 0) return { migrated: false };
+
+  let json: any;
+  try {
+    json = JSON.parse(fs.readFileSync(LEGACY_JSON_PATH, "utf-8"));
+  } catch (err) {
+    console.error("Could not parse data/db.json; skipping migration.", err);
+    return { migrated: false };
+  }
+
+  const counts: Record<string, number> = {};
+  inTransaction(() => {
+    // short_id and export_id are NOT NULL UNIQUE in the schema, so backfill any
+    // playlist that predates those fields. This subsumes the old
+    // migrateShortIds() pass, which the constraints now make unnecessary.
+    let maxShortId = 0;
+    for (const p of json.playlists ?? []) {
+      if (typeof p.shortId === "number" && p.shortId > maxShortId) maxShortId = p.shortId;
+    }
+    for (const p of json.playlists ?? []) {
+      playlists.insert({
+        ...p,
+        userId: p.userId ?? "local-user",
+        categories: p.categories ?? [],
+        shortId: p.shortId || ++maxShortId,
+        exportId: p.exportId || randomUUID(),
+      });
+    }
+    counts.playlists = (json.playlists ?? []).length;
+
+    channels.insertMany(json.channels ?? []);
+    counts.channels = (json.channels ?? []).length;
+
+    for (const s of json.epgSources ?? []) epgSources.insert(s);
+    counts.epgSources = (json.epgSources ?? []).length;
+
+    for (const s of json.channelPoolSources ?? []) poolSources.insert(s);
+    counts.channelPoolSources = (json.channelPoolSources ?? []).length;
+
+    // Grouped per source so each insert satisfies the foreign key.
+    const bySource = new Map<string, ChannelPoolEntry[]>();
+    for (const e of json.channelPoolEntries ?? []) {
+      if (!bySource.has(e.sourceId)) bySource.set(e.sourceId, []);
+      bySource.get(e.sourceId)!.push(e);
+    }
+    let entryCount = 0;
+    for (const [sourceId, list] of bySource) {
+      if (!poolSources.byId(sourceId)) {
+        console.warn(
+          `Skipping ${list.length} pool entries for missing source ${sourceId}`,
+        );
+        continue;
+      }
+      poolEntries.replaceForSource(sourceId, list);
+      entryCount += list.length;
+    }
+    counts.channelPoolEntries = entryCount;
+
+    for (const l of json.channelPoolChangeLogs ?? []) poolChangeLogs.insert(l);
+    counts.channelPoolChangeLogs = (json.channelPoolChangeLogs ?? []).length;
+  });
+
+  return { migrated: true, counts };
+}

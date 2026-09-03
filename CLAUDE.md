@@ -14,26 +14,30 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 - `npm run preview` — `vite preview`.
 - `npm run lint` — `eslint . && tsc --noEmit`. This is also the typecheck command; there's no separate `typecheck` script.
 - `npm run clean` — `rm -rf dist`.
-- No test runner is configured.
+- `npm run verify:migration` — checks the `data/db.json` → SQLite import is lossless, against a throwaway database. No general test runner is configured.
 - Production process management is PM2 via `ecosystem.config.cjs` (`pm2 start ecosystem.config.cjs`).
 
 ## Architecture
 
-### One backend file, one JSON database
+### One backend file, one SQLite database
 
 - `server.ts` is the entire backend — a single Express app with every route registered inline inside `startServer()`. No router modules, no ORM.
-- Persistence is a single JSON file, `data/db.json` (gitignored, auto-created on boot with empty arrays). `readDb()`/`writeDb()` synchronously read/rewrite the *whole file* on every mutation — there are no transactions and no migration framework (one-off migrations like `migrateShortIds()` just run unconditionally at boot). This is adequate only because the app is single-user/local; don't add code that assumes concurrent writers.
+- Persistence is SQLite via Node's built-in `node:sqlite` (no dependency), in `db.ts`. That file owns the schema, the row mappers, a plain-function repository per entity (`store.playlists`, `store.channels`, `store.epgSources`, `store.poolSources`, `store.poolEntries`, `store.poolChangeLogs`) and `inTransaction()`. The database lives at `data/m3u4me.db` (gitignored, WAL mode). `M3U4ME_DB_PATH` overrides the path for tests.
+- **Requires Node 24+** (see `engines` and `.nvmrc`) — both for `node:sqlite` and because `npm run start` runs `node server.ts` directly, relying on native TypeScript type-stripping.
+- Multi-statement writes must go through `store.inTransaction(...)` so they cannot half-apply. Columns are snake_case, TypeScript objects stay camelCase, and each table has an explicit `rowTo*` mapper — no automatic name conversion.
+- Every mutable row carries a `version` column. It is incremented on write but **not yet enforced**; optimistic concurrency (`If-Match` / `ETag` / 409) is a later phase.
+- The previous store was a single JSON file, `data/db.json`, whose `readDb()`/`writeDb()` rewrote the whole document per mutation. `db.ts`'s `migrateFromJson()` imports it once on first boot when the database is empty, then leaves it alone as a rollback copy; `npm run verify:migration` re-checks that import field-for-field against a throwaway database. That migration also backfills `shortId`/`exportId`, which is why the old `migrateShortIds()` boot pass is gone — `short_id` is now `NOT NULL UNIQUE`.
 - Auth secrets live in a separate gitignored file, `data/auth.json`.
 - In dev (`NODE_ENV !== 'production'`), `server.ts` creates a Vite server in middleware mode and mounts it; in production it serves `dist/` statically with an `index.html` catch-all for client-side routing.
 
 ### Data model — duplicated by hand across backend and frontend
 
-`server.ts` and `src/apiClient.ts` each declare their own copies of `Playlist`, `Channel`, `EpgSource`, `ChannelPoolSource`, etc. There's no shared types package — when changing a shape, update both files.
+`db.ts` is the source of truth for the backend types (`Playlist`, `Channel`, `EpgSource`, `ChannelPoolSource`, `ChannelPoolEntry`, `ChannelPoolChangeLog`); `server.ts` imports them. `src/apiClient.ts` still declares its own frontend copies — there's no shared types package, so when changing a shape update `db.ts` and `src/apiClient.ts`.
 
 - **`Playlist`** — has a `shortId` (small incrementing integer used in the public `/[shortId]` and `/[shortId]/epg` URLs) and an `exportId` (UUID, legacy long-form export route kept for backwards compatibility).
 - **`Channel`** — belongs to one playlist + one category string; `order` drives manual drag-reordering.
-- **`EpgSource`** — an XMLTV URL (optionally gzip) or Xtream Codes credentials. Parsed programme/channel data is cached **in memory only** (`epgCache` Map keyed by source id) — it is never written to `db.json`, so it's rebuilt from scratch on every server restart via `refreshEpgSource()`, which runs for every stored source at boot and again on a 5-minute interval check against each source's `refreshIntervalHours`.
-- **`ChannelPoolSource` / `ChannelPoolEntry` / `ChannelPoolChangeLog`** — a separate "bulk source" concept, distinct from playlists: an Xtream account, a playlist URL, or an uploaded file that you browse and cherry-pick channels from into an actual playlist. Entries *are* persisted to `db.json` (mirrored into an in-memory `channelPoolCache` for the running session). Each refresh diffs old vs. new entries by stream URL and appends an added/removed/renamed changelog entry, pruned to entries newer than 90 days.
+- **`EpgSource`** — an XMLTV URL (optionally gzip) or Xtream Codes credentials. Parsed programme/channel data is cached **in memory only** (`epgCache` Map keyed by source id) — it is never persisted, so it's rebuilt from scratch on every server restart via `refreshEpgSource()`, which runs for every stored source at boot and again on a 5-minute interval check against each source's `refreshIntervalHours`.
+- **`ChannelPoolSource` / `ChannelPoolEntry` / `ChannelPoolChangeLog`** — a separate "bulk source" concept, distinct from playlists: an Xtream account, a playlist URL, or an uploaded file that you browse and cherry-pick channels from into an actual playlist. Entries *are* persisted (the `channel_pool_entries` table, mirrored into an in-memory `channelPoolCache` for the running session). Each refresh diffs old vs. new entries by stream URL and appends an added/removed/renamed changelog entry, pruned to entries newer than 90 days.
 
 ### Auth is bespoke — and unrelated to `AuthContext`
 

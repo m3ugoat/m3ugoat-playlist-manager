@@ -6,118 +6,28 @@ import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { gunzipSync } from "zlib";
 import { XMLParser } from "fast-xml-parser";
+import * as store from "./db.ts";
+import type {
+  Playlist,
+  Channel,
+  EpgSource,
+  ChannelPoolSource,
+  ChannelPoolEntry,
+  ChannelPoolChangeLog,
+} from "./db.ts";
 const DATA_DIR = path.join(process.cwd(), "data");
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const DB_FILE = path.join(DATA_DIR, "db.json");
 
-// Define types matching frontend
-interface Playlist {
-  id: string;
-  name: string;
-  userId: string;
-  categories: string[];
-  exportId: string;
-  shortId: number;
-  createdAt: number;
-  updatedAt: number;
-}
-
-interface Channel {
-  id: string;
-  playlistId: string;
-  name: string;
-  url: string;
-  logo: string | null;
-  tvgId: string | null;
-  category: string;
-  order: number;
-  isHidden?: boolean;
-  createdAt: number;
-  updatedAt: number;
-}
-
-interface EpgSource {
-  id: string;
-  name: string;
-  url: string;
-  type: 'xml' | 'xtream';
-  xtreamCredentials?: { username: string; password: string };
-  refreshIntervalHours: number; // configurable per source, default 12
-  lastFetched: number | null;
-  lastFetchError: string | null; // set when the most recent refresh attempt failed; cleared on success
-  channelCount: number;
-  createdAt: number;
-  updatedAt: number;
-}
-
-interface ChannelPoolSource {
-  id: string;
-  name: string;
-  type: 'xtream' | 'playlist-url' | 'playlist-file';
-  url: string | null;
-  xtreamCredentials?: { username: string; password: string };
-  refreshIntervalHours: number;
-  lastFetched: number | null;
-  lastFetchError: string | null; // set when the most recent refresh attempt failed; cleared on success
-  channelCount: number;
-  createdAt: number;
-  updatedAt: number;
-}
-
-interface ChannelPoolEntry {
-  id: string;
-  sourceId: string;
-  name: string;
-  url: string;
-  logo: string | null;
-  category: string;
-  tvgId: string | null;
-}
-
-interface ChannelPoolChangeLog {
-  id: string;
-  sourceId: string;
-  sourceName: string;
-  timestamp: number;
-  added: { name: string; category: string }[];
-  removed: { name: string; category: string }[];
-  renamed: { oldName: string; newName: string; category: string }[];
-}
-
-interface Database {
-  playlists: Playlist[];
-  channels: Channel[];
-  epgSources: EpgSource[];
-  channelPoolSources: ChannelPoolSource[];
-  channelPoolEntries: ChannelPoolEntry[];
-  channelPoolChangeLogs: ChannelPoolChangeLog[];
-}
-
-// Initial DB
-if (!fs.existsSync(DB_FILE)) {
-  fs.writeFileSync(DB_FILE, JSON.stringify({ playlists: [], channels: [], epgSources: [], channelPoolSources: [], channelPoolEntries: [], channelPoolChangeLogs: [] }, null, 2));
-}
-
-// Simple DB sync functions (fine for local single-user apps)
-function readDb(): Database {
-  try {
-    const data = fs.readFileSync(DB_FILE, "utf-8");
-    const parsed = JSON.parse(data);
-    if (!parsed.epgSources) parsed.epgSources = [];
-    if (!parsed.channelPoolSources) parsed.channelPoolSources = [];
-    if (!parsed.channelPoolEntries) parsed.channelPoolEntries = [];
-    if (!parsed.channelPoolChangeLogs) parsed.channelPoolChangeLogs = [];
-    return parsed;
-  } catch (e) {
-    return { playlists: [], channels: [], epgSources: [], channelPoolSources: [], channelPoolEntries: [], channelPoolChangeLogs: [] };
-  }
-}
-
-function writeDb(data: Database) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+// Persistence lives in db.ts (SQLite). The previous store rewrote the whole of
+// data/db.json on every mutation, which loses updates as soon as more than one
+// client writes; every write below is now a scoped statement in a transaction.
+// data/db.json is migrated on first boot and then left alone as a rollback copy.
+const migration = store.migrateFromJson();
+if (migration.migrated) {
+  console.log("Migrated data/db.json into SQLite:", migration.counts);
 }
 
 // ── EPG Cache and Parser ─────────────────────────────────────────────────
@@ -217,30 +127,21 @@ async function fetchAndParseEpg(source: EpgSource): Promise<{ channels: ParsedEp
 }
 
 async function refreshEpgSource(sourceId: string) {
-  const db = readDb();
-  const source = db.epgSources.find(s => s.id === sourceId);
+  const source = store.epgSources.byId(sourceId);
   if (!source) return;
   try {
     const data = await fetchAndParseEpg(source);
     epgCache.set(sourceId, { ...data, fetchedAt: Date.now() });
 
-    const updatedDb = readDb();
-    const idx = updatedDb.epgSources.findIndex(s => s.id === sourceId);
-    if (idx !== -1) {
-      updatedDb.epgSources[idx].lastFetched = Date.now();
-      updatedDb.epgSources[idx].channelCount = data.channels.length;
-      updatedDb.epgSources[idx].lastFetchError = null;
-      writeDb(updatedDb);
-    }
+    store.epgSources.update(sourceId, {
+      lastFetched: Date.now(),
+      channelCount: data.channels.length,
+      lastFetchError: null,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Failed to refresh EPG source ${source.name}:`, err);
-    const updatedDb = readDb();
-    const idx = updatedDb.epgSources.findIndex(s => s.id === sourceId);
-    if (idx !== -1) {
-      updatedDb.epgSources[idx].lastFetchError = message;
-      writeDb(updatedDb);
-    }
+    store.epgSources.update(sourceId, { lastFetchError: message });
   }
 }
 
@@ -427,13 +328,11 @@ function keyEntriesByUrlOccurrence(entries: ChannelPoolEntry[]): Map<string, Cha
 
 /** Diffs old vs. new entries and logs the changes. Returns whether anything actually changed. */
 function detectChannelPoolChanges(sourceId: string, newEntries: ChannelPoolEntry[]): boolean {
-  const db = readDb();
-  const oldEntries = db.channelPoolEntries.filter(e => e.sourceId === sourceId);
-  const source = db.channelPoolSources.find(s => s.id === sourceId);
+  const oldEntries = store.poolEntries.bySource(sourceId);
+  const source = store.poolSources.byId(sourceId);
 
   if (!oldEntries.length) {
-    db.channelPoolEntries = db.channelPoolEntries.filter(e => e.sourceId !== sourceId).concat(newEntries);
-    writeDb(db);
+    store.inTransaction(() => store.poolEntries.replaceForSource(sourceId, newEntries));
     return newEntries.length > 0;
   }
 
@@ -460,31 +359,32 @@ function detectChannelPoolChanges(sourceId: string, newEntries: ChannelPoolEntry
   }
   
   const hasChanges = added.length > 0 || removed.length > 0 || renamed.length > 0;
-  if (hasChanges) {
-    const log: ChannelPoolChangeLog = {
-      id: uuidv4(),
-      sourceId,
-      sourceName: source?.name || 'Unknown Source',
-      timestamp: Date.now(),
-      added,
-      removed,
-      renamed,
-    };
-    db.channelPoolChangeLogs.push(log);
 
-    const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
-    db.channelPoolChangeLogs = db.channelPoolChangeLogs.filter(l => l.timestamp > ninetyDaysAgo);
-  }
+  // The changelog append, the 90-day prune and the entry swap go in one
+  // transaction so a failure can't leave entries replaced but unlogged.
+  store.inTransaction(() => {
+    if (hasChanges) {
+      const log: ChannelPoolChangeLog = {
+        id: uuidv4(),
+        sourceId,
+        sourceName: source?.name || 'Unknown Source',
+        timestamp: Date.now(),
+        added,
+        removed,
+        renamed,
+      };
+      store.poolChangeLogs.insert(log);
+      store.poolChangeLogs.pruneOlderThan(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    }
+    store.poolEntries.replaceForSource(sourceId, newEntries);
+  });
 
-  db.channelPoolEntries = db.channelPoolEntries.filter(e => e.sourceId !== sourceId).concat(newEntries);
-  writeDb(db);
   return hasChanges;
 }
 
 /** Refreshes a Channel Pool source's entries. Returns whether the entries actually changed. */
 async function refreshChannelPoolSource(sourceId: string): Promise<boolean> {
-  const db = readDb();
-  const source = db.channelPoolSources.find(s => s.id === sourceId);
+  const source = store.poolSources.byId(sourceId);
   if (!source || source.type === 'playlist-file') return false;
 
   try {
@@ -498,24 +398,16 @@ async function refreshChannelPoolSource(sourceId: string): Promise<boolean> {
     const changed = detectChannelPoolChanges(sourceId, newEntries);
     channelPoolCache.set(sourceId, newEntries);
 
-    const updatedDb = readDb();
-    const idx = updatedDb.channelPoolSources.findIndex(s => s.id === sourceId);
-    if (idx !== -1) {
-      updatedDb.channelPoolSources[idx].lastFetched = Date.now();
-      updatedDb.channelPoolSources[idx].channelCount = newEntries.length;
-      updatedDb.channelPoolSources[idx].lastFetchError = null;
-      writeDb(updatedDb);
-    }
+    store.poolSources.update(sourceId, {
+      lastFetched: Date.now(),
+      channelCount: newEntries.length,
+      lastFetchError: null,
+    });
     return changed;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Failed to refresh Channel Pool source ${source.name}:`, err);
-    const updatedDb = readDb();
-    const idx = updatedDb.channelPoolSources.findIndex(s => s.id === sourceId);
-    if (idx !== -1) {
-      updatedDb.channelPoolSources[idx].lastFetchError = message;
-      writeDb(updatedDb);
-    }
+    store.poolSources.update(sourceId, { lastFetchError: message });
     return false;
   }
 }
@@ -589,17 +481,9 @@ function formatRecoveryKey(key: string): string {
   return key.match(/.{1,4}/g)!.join('-');
 }
 
-// Assign shortIds to any playlists that pre-date this feature
-function migrateShortIds() {
-  const db = readDb();
-  let max = Math.max(0, ...db.playlists.map(p => p.shortId || 0));
-  let changed = false;
-  for (const pl of db.playlists) {
-    if (!pl.shortId) { pl.shortId = ++max; changed = true; }
-  }
-  if (changed) writeDb(db);
-}
-migrateShortIds();
+// The old migrateShortIds() pass lived here. It is no longer needed: short_id is
+// NOT NULL UNIQUE in the schema and migrateFromJson() backfills any playlist
+// that predates the field, so a playlist without one cannot reach the database.
 
 // M3U/EXTINF has no formal attribute-escaping spec, so quotes inside a value would
 // otherwise prematurely close the attribute and corrupt the line for any parser.
@@ -631,10 +515,11 @@ function escapeCData(value: string): string {
   return value.replace(/]]>/g, "]]]]><![CDATA[>");
 }
 
-function serveM3U(playlist: Playlist, db: Database, res: any) {
+function serveM3U(playlist: Playlist, res: any) {
   const catIndex = new Map(playlist.categories.map((cat, i) => [cat, i]));
-  const channels = db.channels
-    .filter(c => c.playlistId === playlist.id && !c.isHidden)
+  const channels = store.channels
+    .byPlaylist(playlist.id)
+    .filter(c => !c.isHidden)
     .sort((a, b) => {
       const catA = catIndex.has(a.category) ? catIndex.get(a.category)! : playlist.categories.length;
       const catB = catIndex.has(b.category) ? catIndex.get(b.category)! : playlist.categories.length;
@@ -664,15 +549,14 @@ async function startServer() {
   // Initialize EPG Cache. Refreshed one source at a time (not all at once) —
   // see refreshEpgSourcesSequentially. This is fired without awaiting so it
   // doesn't delay the server from listening.
-  const dbConfig = readDb();
-  refreshEpgSourcesSequentially(dbConfig.epgSources.map(s => s.id));
+  refreshEpgSourcesSequentially(store.epgSources.all().map(s => s.id));
   const channelPoolSourceIdsToRefresh: string[] = [];
-  for (const source of dbConfig.channelPoolSources) {
+  for (const source of store.poolSources.all()) {
     if (source.type !== 'playlist-file') {
       channelPoolSourceIdsToRefresh.push(source.id);
     } else {
-      const entries = dbConfig.channelPoolEntries.filter(e => e.sourceId === source.id);
-      channelPoolCache.set(source.id, entries);
+      // Uploaded files are never re-fetched, so seed the cache from what's stored.
+      channelPoolCache.set(source.id, store.poolEntries.bySource(source.id));
     }
   }
   // Same reasoning as the EPG sources above — refreshed one at a time (see
@@ -682,12 +566,11 @@ async function startServer() {
   refreshChannelPoolSourcesSequentially(channelPoolSourceIdsToRefresh);
 
   setInterval(() => {
-    const currentDb = readDb();
     const now = Date.now();
     // A source whose last attempt failed is retried on every tick (regardless
     // of its refresh interval) until it succeeds, instead of silently sitting
     // empty until the interval next comes due.
-    const dueEpgSourceIds = currentDb.epgSources.filter(source => {
+    const dueEpgSourceIds = store.epgSources.all().filter(source => {
       const intervalMs = (source.refreshIntervalHours || 12) * 60 * 60 * 1000;
       return !source.lastFetched || source.lastFetchError || (now - source.lastFetched) > intervalMs;
     }).map(source => source.id);
@@ -696,7 +579,7 @@ async function startServer() {
     // above), instead of silently sitting on stale/empty data until the interval next
     // comes due — which for the default 24h channel-pool interval could otherwise mean
     // a whole day before an invalid-login error is retried after being fixed.
-    const dueChannelPoolSourceIds = currentDb.channelPoolSources.filter(source => {
+    const dueChannelPoolSourceIds = store.poolSources.all().filter(source => {
       if (source.type === 'playlist-file') return false;
       const intervalMs = (source.refreshIntervalHours || 24) * 60 * 60 * 1000;
       return !source.lastFetched || source.lastFetchError || (now - source.lastFetched) > intervalMs;
@@ -833,11 +716,10 @@ async function startServer() {
 
   // ── EPG Routes ───────────────────────────────────────────────────────
   app.get("/api/epg-sources", (req, res) => {
-    res.json(readDb().epgSources);
+    res.json(store.epgSources.all());
   });
 
   app.post("/api/epg-sources", async (req, res) => {
-    const db = readDb();
     const newSource: EpgSource = {
       id: uuidv4(),
       ...req.body,
@@ -848,28 +730,22 @@ async function startServer() {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
-    db.epgSources.push(newSource);
-    writeDb(db);
+    store.epgSources.insert(newSource);
     await refreshEpgSource(newSource.id);
-    res.json(newSource);
+    res.json(store.epgSources.byId(newSource.id) ?? newSource);
   });
 
   app.put("/api/epg-sources/:id", (req, res) => {
-    const db = readDb();
-    const idx = db.epgSources.findIndex(s => s.id === req.params.id);
-    if (idx !== -1) {
-      db.epgSources[idx] = { ...db.epgSources[idx], ...req.body, updatedAt: Date.now() };
-      writeDb(db);
-      res.json(db.epgSources[idx]);
+    const updated = store.epgSources.update(req.params.id, req.body);
+    if (updated) {
+      res.json(updated);
     } else {
       res.status(404).json({ error: "Not found" });
     }
   });
 
   app.delete("/api/epg-sources/:id", (req, res) => {
-    const db = readDb();
-    db.epgSources = db.epgSources.filter(s => s.id !== req.params.id);
-    writeDb(db);
+    store.epgSources.delete(req.params.id);
     epgCache.delete(req.params.id);
     res.json({ success: true });
   });
@@ -881,7 +757,7 @@ async function startServer() {
   });
 
   app.get("/api/epg-sources/:id/channels", (req, res) => {
-    const source = readDb().epgSources.find(s => s.id === req.params.id);
+    const source = store.epgSources.byId(req.params.id);
     if (!source) return res.status(404).json({ error: "Not found" });
     const cache = epgCache.get(req.params.id);
     if (!cache) return res.json([]);
@@ -938,7 +814,7 @@ async function startServer() {
     if (!q) return res.json([]);
     
     const results = [];
-    const dbSources = readDb().epgSources;
+    const dbSources = store.epgSources.all();
     
     for (const [sourceId, cache] of epgCache.entries()) {
       const source = dbSources.find(s => s.id === sourceId);
@@ -959,7 +835,7 @@ async function startServer() {
     const { ids } = req.body as { ids: string[] };
     if (!ids || !Array.isArray(ids)) return res.json({});
     
-    const dbSources = readDb().epgSources;
+    const dbSources = store.epgSources.all();
     const result: Record<string, { displayName: string; sourceName: string }> = {};
     
     // Build a lookup set for fast matching
@@ -980,7 +856,7 @@ async function startServer() {
 
   // ── Channel Pool Routes ───────────────────────────────────────────────────────
   app.get("/api/channel-pool/sources", (req, res) => {
-    res.json(readDb().channelPoolSources);
+    res.json(store.poolSources.all());
   });
 
   app.post("/api/channel-pool/validate-url", async (req, res) => {
@@ -1040,7 +916,6 @@ async function startServer() {
   });
 
   app.post("/api/channel-pool/sources", async (req, res) => {
-    const db = readDb();
     const newSource: ChannelPoolSource = {
       id: uuidv4(),
       ...req.body,
@@ -1051,51 +926,44 @@ async function startServer() {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
-    db.channelPoolSources.push(newSource);
-    writeDb(db);
-    
+    store.poolSources.insert(newSource);
+
     if (newSource.type !== 'playlist-file') {
       await refreshChannelPoolSource(newSource.id);
     }
-    const updatedDb = readDb();
-    res.json(updatedDb.channelPoolSources.find(s => s.id === newSource.id) || newSource);
+    res.json(store.poolSources.byId(newSource.id) || newSource);
   });
 
   app.put("/api/channel-pool/sources/:id", (req, res) => {
-    const db = readDb();
-    const idx = db.channelPoolSources.findIndex(s => s.id === req.params.id);
-    if (idx !== -1) {
-      db.channelPoolSources[idx] = { ...db.channelPoolSources[idx], ...req.body, updatedAt: Date.now() };
-      writeDb(db);
-      res.json(db.channelPoolSources[idx]);
+    const updated = store.poolSources.update(req.params.id, req.body);
+    if (updated) {
+      res.json(updated);
     } else {
       res.status(404).json({ error: "Not found" });
     }
   });
 
   app.delete("/api/channel-pool/sources/:id", (req, res) => {
-    const db = readDb();
-    db.channelPoolSources = db.channelPoolSources.filter(s => s.id !== req.params.id);
-    db.channelPoolEntries = db.channelPoolEntries.filter(e => e.sourceId !== req.params.id);
-    db.channelPoolChangeLogs = db.channelPoolChangeLogs.filter(l => l.sourceId !== req.params.id);
-    writeDb(db);
+    store.inTransaction(() => {
+      // Entries cascade from the source row; changelogs are cleared explicitly.
+      store.poolChangeLogs.deleteBySource(req.params.id);
+      store.poolSources.delete(req.params.id);
+    });
     channelPoolCache.delete(req.params.id);
     res.json({ success: true });
   });
 
   app.post("/api/channel-pool/sources/:id/refresh", async (req, res) => {
     const changed = await refreshChannelPoolSource(req.params.id);
-    const db = readDb();
-    const source = db.channelPoolSources.find(s => s.id === req.params.id);
+    const source = store.poolSources.byId(req.params.id);
     res.json({ success: true, channelCount: source?.channelCount || 0, changed });
   });
 
   app.get("/api/channel-pool/sources/:id/channels", (req, res) => {
-    const db = readDb();
-    const source = db.channelPoolSources.find(s => s.id === req.params.id);
+    const source = store.poolSources.byId(req.params.id);
     if (!source) return res.status(404).json({ error: "Not found" });
-    
-    let entries = channelPoolCache.get(req.params.id) || db.channelPoolEntries.filter(e => e.sourceId === req.params.id);
+
+    let entries = channelPoolCache.get(req.params.id) || store.poolEntries.bySource(req.params.id);
     
     const q = String(req.query.q || '').trim().toLowerCase();
     const cat = String(req.query.category || '').trim();
@@ -1115,8 +983,7 @@ async function startServer() {
   });
 
   app.get("/api/channel-pool/sources/:id/categories", (req, res) => {
-    const db = readDb();
-    const entries = channelPoolCache.get(req.params.id) || db.channelPoolEntries.filter(e => e.sourceId === req.params.id);
+    const entries = channelPoolCache.get(req.params.id) || store.poolEntries.bySource(req.params.id);
     
     const categories = new Set(entries.map(e => e.category));
     const sorted = Array.from(categories).sort((a, b) => a.localeCompare(b));
@@ -1124,11 +991,10 @@ async function startServer() {
   });
 
   app.get("/api/channel-pool/changelog", (req, res) => {
-    const db = readDb();
     const page = Math.max(1, parseInt(String(req.query.page), 10) || 1);
     const perPage = 20;
-    
-    const logs = db.channelPoolChangeLogs.sort((a, b) => b.timestamp - a.timestamp);
+
+    const logs = store.poolChangeLogs.all();
     const total = logs.length;
     const paginatedLogs = logs.slice((page - 1) * perPage, page * perPage);
     
@@ -1139,7 +1005,6 @@ async function startServer() {
   });
 
   app.post("/api/channel-pool/sources/upload", (req, res) => {
-    const db = readDb();
     const { name, content, filename } = req.body;
     
     if (!name || !content || !filename) {
@@ -1159,18 +1024,20 @@ async function startServer() {
       updatedAt: Date.now(),
     };
     
-    db.channelPoolSources.push(newSource);
-    
     let entries: ChannelPoolEntry[] = [];
     if (content.trim().startsWith('<?xml') && content.includes('<playlist')) {
       entries = parseXspfToChannelPoolEntries(content, newSource.id);
     } else {
       entries = parseM3uToChannelPoolEntries(content, newSource.id);
     }
-    
+
     newSource.channelCount = entries.length;
-    db.channelPoolEntries.push(...entries);
-    writeDb(db);
+    // Source row and its entries land together, so an upload can never leave a
+    // source with a channelCount it has no entries to back.
+    store.inTransaction(() => {
+      store.poolSources.insert(newSource);
+      store.poolEntries.replaceForSource(newSource.id, entries);
+    });
     
     channelPoolCache.set(newSource.id, entries);
     
@@ -1187,14 +1054,12 @@ async function startServer() {
   });
 
   app.get("/api/playlists", (req, res) => {
-    const db = readDb();
-    res.json(db.playlists);
+    res.json(store.playlists.all());
   });
 
   app.post("/api/playlists", (req, res) => {
-    const db = readDb();
     const { name } = req.body;
-    const nextShortId = Math.max(0, ...db.playlists.map(p => p.shortId || 0)) + 1;
+    const nextShortId = store.playlists.nextShortId();
     const newPlaylist: Playlist = {
       id: uuidv4(),
       name: name || "Unnamed Playlist",
@@ -1205,8 +1070,7 @@ async function startServer() {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
-    db.playlists.push(newPlaylist);
-    writeDb(db);
+    store.playlists.insert(newPlaylist);
     res.json(newPlaylist);
   });
 
@@ -1268,8 +1132,7 @@ async function startServer() {
       return res.status(400).json({ error: "No channels found in that playlist" });
     }
 
-    const db = readDb();
-    const nextShortId = Math.max(0, ...db.playlists.map(p => p.shortId || 0)) + 1;
+    const nextShortId = store.playlists.nextShortId();
     const categories = Array.from(new Set(entries.map(e => e.category || "General")));
     const newPlaylist: Playlist = {
       id: uuidv4(),
@@ -1296,18 +1159,19 @@ async function startServer() {
       updatedAt: Date.now(),
     }));
 
-    db.playlists.push(newPlaylist);
-    db.channels = [...db.channels, ...newChannels];
-    writeDb(db);
+    // Playlist and its imported channels commit together — a partial import
+    // would otherwise leave an empty playlist behind.
+    store.inTransaction(() => {
+      store.playlists.insert(newPlaylist);
+      store.channels.insertMany(newChannels);
+    });
 
     res.json(newPlaylist);
   });
 
   app.put("/api/playlists/:playlistId", (req, res) => {
-    const db = readDb();
     const { playlistId } = req.params;
-    const idx = db.playlists.findIndex(p => p.id === playlistId);
-    if (idx === -1) {
+    if (!store.playlists.byId(playlistId)) {
       return res.status(404).json({ error: "Not found" });
     }
     if (Array.isArray(req.body.categories)) {
@@ -1321,35 +1185,26 @@ async function startServer() {
       }
       req.body.categories = trimmed;
     }
-    db.playlists[idx] = { ...db.playlists[idx], ...req.body, updatedAt: Date.now() };
-    writeDb(db);
-    res.json(db.playlists[idx]);
+    const updated = store.playlists.update(playlistId, req.body);
+    res.json(updated);
   });
 
   app.delete("/api/playlists/:playlistId", (req, res) => {
-    const db = readDb();
-    const { playlistId } = req.params;
-    db.playlists = db.playlists.filter(p => p.id !== playlistId);
-    db.channels = db.channels.filter(c => c.playlistId !== playlistId);
-    writeDb(db);
+    // Channels are removed by the ON DELETE CASCADE on channels.playlist_id.
+    store.playlists.delete(req.params.playlistId);
     res.json({ success: true });
   });
 
   app.get("/api/playlists/:playlistId/channels", (req, res) => {
-    const db = readDb();
-    const { playlistId } = req.params;
-    const channels = db.channels.filter(c => c.playlistId === playlistId).sort((a, b) => a.order - b.order);
-    res.json(channels);
+    res.json(store.channels.byPlaylist(req.params.playlistId));
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk", (req, res) => {
-    const db = readDb();
     const { playlistId } = req.params;
     const { channels } = req.body;
-    
+
     // Auto increment order
-    const existing = db.channels.filter(c => c.playlistId === playlistId);
-    let maxOrder = existing.length > 0 ? Math.max(...existing.map(c => c.order)) : 0;
+    const maxOrder = store.channels.maxOrder(playlistId);
 
     const newChannels: Channel[] = channels.map((c: any, i: number) => {
       // Find category and add it to playlist if missing
@@ -1369,97 +1224,98 @@ async function startServer() {
       };
     });
 
-    db.channels = [...db.channels, ...newChannels];
+    // Channels and any new categories they introduce commit together.
+    store.inTransaction(() => {
+      store.channels.insertMany(newChannels);
 
-    // Update categories — preserve existing order, append new ones at the end
-    const playlist = db.playlists.find(p => p.id === playlistId);
-    if (playlist) {
-      const existingSet = new Set(playlist.categories);
-      newChannels.forEach(c => {
-        if (!existingSet.has(c.category)) {
-          playlist.categories.push(c.category);
-          existingSet.add(c.category);
+      // Update categories — preserve existing order, append new ones at the end
+      const playlist = store.playlists.byId(playlistId);
+      if (playlist) {
+        const categories = [...playlist.categories];
+        const existingSet = new Set(categories);
+        newChannels.forEach(c => {
+          if (!existingSet.has(c.category)) {
+            categories.push(c.category);
+            existingSet.add(c.category);
+          }
+        });
+        if (categories.length !== playlist.categories.length) {
+          store.playlists.update(playlistId, { categories });
         }
-      });
-    }
+      }
+    });
 
-    writeDb(db);
     res.json({ success: true, added: newChannels.length, ids: newChannels.map((c: Channel) => c.id) });
   });
 
   app.put("/api/playlists/:playlistId/channels/:channelId", (req, res) => {
-    const db = readDb();
-    const { channelId } = req.params;
-    const idx = db.channels.findIndex(c => c.id === channelId);
-    if (idx !== -1) {
-      db.channels[idx] = { ...db.channels[idx], ...req.body, updatedAt: Date.now() };
-      writeDb(db);
-      res.json(db.channels[idx]);
+    const updated = store.channels.update(req.params.channelId, req.body);
+    if (updated) {
+      res.json(updated);
     } else {
       res.status(404).json({ error: "Not found" });
     }
   });
 
   app.delete("/api/playlists/:playlistId/channels/:channelId", (req, res) => {
-    const db = readDb();
-    const { channelId } = req.params;
-    db.channels = db.channels.filter(c => c.id !== channelId);
-    writeDb(db);
+    store.channels.delete(req.params.channelId);
     res.json({ success: true });
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk-update", (req, res) => {
-    const db = readDb();
     const { playlistId } = req.params;
     const { ids, updates } = req.body;
-    db.channels = db.channels.map(c => {
-      if (c.playlistId === playlistId && ids.includes(c.id)) {
-        return { ...c, ...updates, updatedAt: Date.now() };
+
+    store.inTransaction(() => {
+      const idSet = new Set<string>(ids ?? []);
+      for (const c of store.channels.byPlaylist(playlistId)) {
+        if (idSet.has(c.id)) store.channels.update(c.id, updates);
       }
-      return c;
+
+      // Handle new category dynamic pushing
+      if (updates.category) {
+        const playlist = store.playlists.byId(playlistId);
+        if (playlist && !playlist.categories.includes(updates.category)) {
+          store.playlists.update(playlistId, {
+            categories: [...playlist.categories, updates.category],
+          });
+        }
+      }
     });
 
-    // Handle new category dynamic pushing
-    if (updates.category) {
-      const playlist = db.playlists.find(p => p.id === playlistId);
-      if (playlist && !playlist.categories.includes(updates.category)) {
-        playlist.categories.push(updates.category);
-      }
-    }
-
-    writeDb(db);
     res.json({ success: true });
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk-update-many", (req, res) => {
-    const db = readDb();
     const { playlistId } = req.params;
     const { updates } = req.body; // updates: Array<{ id: string, changes: any }>
 
     const updateMap = new Map<string, any>(updates.map((u: any) => [u.id, u.changes]));
 
-    db.channels = db.channels.map(c => {
-      if (c.playlistId === playlistId && updateMap.has(c.id)) {
+    store.inTransaction(() => {
+      const playlist = store.playlists.byId(playlistId);
+      const categories = playlist ? [...playlist.categories] : [];
+
+      for (const c of store.channels.byPlaylist(playlistId)) {
+        if (!updateMap.has(c.id)) continue;
         const changes = updateMap.get(c.id);
 
         // Handle new category dynamic pushing
-        if (changes.category) {
-          const playlist = db.playlists.find(p => p.id === playlistId);
-          if (playlist && !playlist.categories.includes(changes.category)) {
-            playlist.categories.push(changes.category);
-          }
+        if (changes.category && !categories.includes(changes.category)) {
+          categories.push(changes.category);
         }
-        return { ...c, ...changes, updatedAt: Date.now() };
+        store.channels.update(c.id, changes);
       }
-      return c;
+
+      if (playlist && categories.length !== playlist.categories.length) {
+        store.playlists.update(playlistId, { categories });
+      }
     });
 
-    writeDb(db);
     res.json({ success: true });
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk-replace", (req, res) => {
-    const db = readDb();
     const { playlistId } = req.params;
     const { search, replace, field, ids } = req.body;
     if (!search || typeof search !== "string") {
@@ -1467,40 +1323,45 @@ async function startServer() {
     }
     const targetField = field || "url";
     let modified = 0;
-    db.channels = db.channels.map(c => {
-      if (c.playlistId !== playlistId) return c;
-      if (ids && Array.isArray(ids) && !ids.includes(c.id)) return c;
-      const current = (c as any)[targetField];
-      if (typeof current !== "string" || !current.includes(search)) return c;
-      const updated = current.replaceAll(search, replace ?? "");
-      if (updated === current) return c;
-      modified++;
-      return { ...c, [targetField]: updated, updatedAt: Date.now() };
+
+    store.inTransaction(() => {
+      for (const c of store.channels.byPlaylist(playlistId)) {
+        if (ids && Array.isArray(ids) && !ids.includes(c.id)) continue;
+        const current = (c as any)[targetField];
+        if (typeof current !== "string" || !current.includes(search)) continue;
+        const updated = current.replaceAll(search, replace ?? "");
+        if (updated === current) continue;
+        modified++;
+        store.channels.update(c.id, { [targetField]: updated } as Partial<Channel>);
+      }
     });
-    if (modified > 0) writeDb(db);
+
     res.json({ success: true, modified });
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk-delete", (req, res) => {
-    const db = readDb();
     const { playlistId } = req.params;
     const { ids } = req.body;
-    db.channels = db.channels.filter(c => !(c.playlistId === playlistId && ids.includes(c.id)));
-    writeDb(db);
+    // Scoped to the playlist, matching the previous filter.
+    const idSet = new Set<string>(ids ?? []);
+    const toDelete = store.channels
+      .byPlaylist(playlistId)
+      .filter(c => idSet.has(c.id))
+      .map(c => c.id);
+    store.inTransaction(() => store.channels.deleteMany(toDelete));
     res.json({ success: true });
   });
 
   app.post("/api/playlists/:playlistId/channels/reorder", (req, res) => {
-    const db = readDb();
     const { playlistId } = req.params;
     const { orders } = req.body; // { id: newOrder }
-    db.channels = db.channels.map(c => {
-      if (c.playlistId === playlistId && orders[c.id] !== undefined) {
-        return { ...c, order: orders[c.id], updatedAt: Date.now() };
+    // One transaction for the whole reorder, so a drag can't half-apply.
+    store.inTransaction(() => {
+      const now = Date.now();
+      for (const c of store.channels.byPlaylist(playlistId)) {
+        if (orders[c.id] !== undefined) store.channels.setOrder(c.id, orders[c.id], now);
       }
-      return c;
     });
-    writeDb(db);
     res.json({ success: true });
   });
 
@@ -1549,17 +1410,20 @@ async function startServer() {
   app.get("/api/search", (req, res) => {
     const q = String(req.query.q || '').trim().toLowerCase();
     if (!q) return res.json([]);
-    const db = readDb();
+    const allPlaylists = store.playlists.all();
+    const allChannels = store.channels.all();
+    const allPoolSources = store.poolSources.all();
+    const allEpgSources = store.epgSources.all();
     const matches = (...fields: (string | null | undefined)[]) => fields.some(f => f?.toLowerCase().includes(q));
 
-    const playlistResults = db.channels
+    const playlistResults = allChannels
       .filter(c => matches(c.name, c.url, c.tvgId))
       .slice(0, 50)
       .map(c => ({
         kind: "playlist",
         id: c.id,
         containerId: c.playlistId,
-        containerName: db.playlists.find(p => p.id === c.playlistId)?.name ?? '',
+        containerName: allPlaylists.find(p => p.id === c.playlistId)?.name ?? '',
         category: c.category,
         name: c.name,
         url: c.url,
@@ -1568,14 +1432,15 @@ async function startServer() {
         isHidden: c.isHidden,
       }));
 
-    const channelPoolResults = db.channelPoolEntries
+    const allPoolEntries = allPoolSources.flatMap(s => store.poolEntries.bySource(s.id));
+    const channelPoolResults = allPoolEntries
       .filter(e => matches(e.name, e.url, e.tvgId))
       .slice(0, 50)
       .map(e => ({
         kind: "channelPool",
         id: e.id,
         containerId: e.sourceId,
-        containerName: db.channelPoolSources.find(s => s.id === e.sourceId)?.name ?? '',
+        containerName: allPoolSources.find(s => s.id === e.sourceId)?.name ?? '',
         category: e.category,
         name: e.name,
         url: e.url,
@@ -1588,7 +1453,7 @@ async function startServer() {
     // as soon as the cap is hit instead of scanning every remaining source.
     const epgResults: any[] = [];
     for (const [sourceId, cache] of epgCache.entries()) {
-      const source = db.epgSources.find(s => s.id === sourceId);
+      const source = allEpgSources.find(s => s.id === sourceId);
       if (!source) continue;
       for (const ch of cache.channels) {
         if (!matches(ch.id, ch.displayName)) continue;
@@ -1612,10 +1477,9 @@ async function startServer() {
 
   // Legacy long-form URL (kept for backwards compatibility)
   app.get("/api/playlists/:exportId.m3u", (req, res) => {
-    const db = readDb();
-    const playlist = db.playlists.find(p => p.exportId === req.params.exportId);
+    const playlist = store.playlists.byExportId(req.params.exportId);
     if (!playlist) return res.status(404).send("Playlist not found");
-    serveM3U(playlist, db, res);
+    serveM3U(playlist, res);
   });
 
   // Proxy endpoint for downloading external M3U Links
@@ -1636,11 +1500,12 @@ async function startServer() {
   // EPG XMLTV Server
   app.get(/^\/(\d+)\/epg$/, (req, res) => {
     const shortId = parseInt(req.params[0], 10);
-    const db = readDb();
-    const playlist = db.playlists.find(p => p.shortId === shortId);
+    const playlist = store.playlists.byShortId(shortId);
     if (!playlist) return res.status(404).send("Playlist not found");
 
-    const channels = db.channels.filter(c => c.playlistId === playlist.id && !c.isHidden && c.tvgId);
+    const channels = store.channels
+      .byPlaylist(playlist.id)
+      .filter(c => !c.isHidden && c.tvgId);
     const tvgIds = new Set(channels.map(c => c.tvgId));
 
     res.setHeader("Content-Type", "application/xml");
@@ -1673,10 +1538,9 @@ async function startServer() {
   // Short numeric URL: /1  /2  /3 …
   app.get(/^\/(\d+)$/, (req, res) => {
     const shortId = parseInt(req.params[0], 10);
-    const db = readDb();
-    const playlist = db.playlists.find(p => p.shortId === shortId);
+    const playlist = store.playlists.byShortId(shortId);
     if (!playlist) return res.status(404).send("Playlist not found");
-    serveM3U(playlist, db, res);
+    serveM3U(playlist, res);
   });
 
   // Vite middleware for development
