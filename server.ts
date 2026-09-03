@@ -7,6 +7,7 @@ import crypto from "crypto";
 import { gunzipSync } from "zlib";
 import { XMLParser } from "fast-xml-parser";
 import * as store from "./db.ts";
+import { openapi } from "./openapi.ts";
 import type {
   Playlist,
   Channel,
@@ -708,7 +709,7 @@ async function startServer() {
   // so route handlers (and the per-user scoping in the next phase) have an
   // identity to work with. When no account exists at all, auth stays a complete
   // no-op — same as the old "no password set" behaviour.
-  const publicPaths = ['/auth/status', '/auth/login', '/auth/recover'];
+  const publicPaths = ['/auth/status', '/auth/login', '/auth/recover', '/openapi.json'];
   app.use('/api', (req, res, next) => {
     if (publicPaths.includes(req.path)) return next();
     if (store.users.none()) return next(); // No account set up — allow all
@@ -1350,6 +1351,12 @@ async function startServer() {
     channelPoolCache.set(newSource.id, entries);
     
     res.json(newSource);
+  });
+
+  // The API contract, served unauthenticated so a client author can read it
+  // before they have credentials. openapi.ts is the source of truth.
+  app.get("/api/openapi.json", (_req, res) => {
+    res.json(openapi);
   });
 
   app.get("/api/version", (_req, res) => {

@@ -19,7 +19,9 @@
     "verify:migration": "tsx scripts/verify-migration.ts",
     "verify:auth": "tsx scripts/verify-auth.ts",
     "verify:scoping": "tsx scripts/verify-scoping.ts",
-    "verify:concurrency": "tsx scripts/verify-concurrency.ts"
+    "verify:concurrency": "tsx scripts/verify-concurrency.ts",
+    "verify:openapi": "tsx scripts/verify-openapi.ts",
+    "openapi:write": "tsx scripts/write-openapi.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

@@ -17,7 +17,9 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 - `npm run verify:migration` — checks the `data/db.json` → SQLite import is lossless, against a throwaway database.
 - `npm run verify:auth` — end-to-end account/device-token checks; boots a real server on port 8123 against a throwaway database.
 - `npm run verify:scoping` — end-to-end per-user isolation and export-token checks; boots a real server on port 8126.
-- `npm run verify:concurrency` — end-to-end If-Match/ETag/409 checks; boots a real server on port 8127. No general test runner is configured.
+- `npm run verify:concurrency` — end-to-end If-Match/ETag/409 checks; boots a real server on port 8127.
+- `npm run verify:openapi` — validates the API description and cross-checks it against the real route table in both directions; boots a real server on port 8128. No general test runner is configured.
+- `npm run openapi:write` — regenerates `openapi.json` from `openapi.ts`. Run this after changing the spec, or `verify:openapi` fails on a stale file.
 - Production process management is PM2 via `ecosystem.config.cjs` (`pm2 start ecosystem.config.cjs`).
 
 ## Architecture
@@ -64,6 +66,14 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
   - `GET /e/:token/epg` — the XMLTV document.
   - `GET /:shortId` and `GET /:shortId/epg` are **disabled by default, returning 410 Gone.** `shortId` is a small incrementing integer, so with more than one account these enumerable, unauthenticated routes would expose every playlist — including stream URLs, which in IPTV routinely embed provider credentials. `ALLOW_INSECURE_SHORT_IDS=1` re-enables them (with a startup warning) for a migration window while players are repointed.
   - `serveEpgXml()` filters the global `epgCache` to the playlist owner's EPG sources, so a shared tvg-id can't pull another account's programme data into the document.
+
+### The API description lives in `openapi.ts`
+
+- `openapi.ts` is the **source of truth** for the public contract, authored as a typed object rather than a `.yaml` file: the repo has no YAML parser, `tsc` catches structural typos, and `scripts/verify-openapi.ts` can import it directly.
+- Served unauthenticated at **`GET /api/openapi.json`** (it's in `publicPaths`), so a client author can read the contract before having credentials. `npm run openapi:write` emits the committed `openapi.json` for external tooling.
+- `operationId`s live in one `OPERATION_IDS` table near the top of `openapi.ts`. `applyOperationIds()` **throws at import time** if a route has no id, if an id is duplicated, or if the table names a route that no longer exists — so adding a route without naming it is a startup failure, not a silently unnamed client method. They are public API: don't rename them once published.
+- `verify:openapi` compares declared operations against `server.ts`'s route table **in both directions**, so neither an undocumented route nor a documented-but-missing one can slip through. It also asserts the concurrency contract is described (all 8 conditional routes document `If-Match` and 409; the bulk routes do *not* claim `If-Match`), and that `openapi.json` is not stale.
+- Externally validated with `npx @redocly/cli lint openapi.json` (run via npx, deliberately not a dependency): **valid, 0 errors**. Four warnings remain and are all expected — a `localhost` server URL (correct: this is a self-hosted local app), `/e/{token}` vs `/{shortId}/epg` reported as ambiguous (unavoidable in path templating; at runtime the short-id routes are digit-only regexes registered after `/e/:token`), and two `operation-4xx-response` on `/api/auth/status` and `/api/openapi.json`, which genuinely have no meaningful 4xx.
 
 ### Optimistic concurrency (the sync contract)
 
