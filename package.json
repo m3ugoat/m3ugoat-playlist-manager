@@ -4,6 +4,9 @@
   "description": "A local M3U IPTV playlist manager and server",
   "author": "Open Source Contributor",
   "license": "GPL-3.0",
+  "engines": {
+    "node": ">=24"
+  },
   "private": true,
   "type": "module",
   "scripts": {
@@ -35,8 +38,11 @@
     "autoprefixer": "^10.4.21",
     "eslint": "^10.3.0",
     "tailwindcss": "^4.1.14",
-    "tsx": "^4.21.0",
+    "tsx": "^4.23.13",
     "typescript": "~5.8.2",
     "vite": "^6.2.3"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }

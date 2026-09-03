@@ -15,5 +15,6 @@ dist-ssr/
 # Editor/AI config
 .claude/
 
-# Ignore the live database and auth secrets
+# Ignore the live database, auth secrets, and any backups/exports of them
 data/*.json
+data/backups/
