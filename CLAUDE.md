@@ -15,7 +15,8 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 - `npm run lint` — `eslint . && tsc --noEmit`. This is also the typecheck command; there's no separate `typecheck` script.
 - `npm run clean` — `rm -rf dist`.
 - `npm run verify:migration` — checks the `data/db.json` → SQLite import is lossless, against a throwaway database.
-- `npm run verify:auth` — end-to-end account/device-token checks; boots a real server on port 8123 against a throwaway database. No general test runner is configured.
+- `npm run verify:auth` — end-to-end account/device-token checks; boots a real server on port 8123 against a throwaway database.
+- `npm run verify:scoping` — end-to-end per-user isolation and export-token checks; boots a real server on port 8126. No general test runner is configured.
 - Production process management is PM2 via `ecosystem.config.cjs` (`pm2 start ecosystem.config.cjs`).
 
 ## Architecture
@@ -25,8 +26,12 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 - `server.ts` is the entire backend — a single Express app with every route registered inline inside `startServer()`. No router modules, no ORM.
 - Persistence is SQLite via Node's built-in `node:sqlite` (no dependency), in `db.ts`. That file owns the schema, the row mappers, a plain-function repository per entity (`store.playlists`, `store.channels`, `store.epgSources`, `store.poolSources`, `store.poolEntries`, `store.poolChangeLogs`) and `inTransaction()`. The database lives at `data/m3u4me.db` (gitignored, WAL mode). `M3U4ME_DB_PATH` overrides the path for tests.
 - **Requires Node 24+** (see `engines` and `.nvmrc`) — both for `node:sqlite` and because `npm run start` runs `node server.ts` directly, relying on native TypeScript type-stripping.
+- **Every repository read and write takes the owning `userId`.** That is deliberate: a missing scope is a compile error rather than a silent cross-account leak. The handful of intentional exceptions are named `*Unscoped` (`epgSources.allUnscoped`, `poolSources.byIdUnscoped`, `playlists.byShortIdUnscoped`, …) for the background refresh loops, which run for every account and have no request user, plus `channels.byPlaylistForExport` for the public export routes. `server.ts`'s `actingUserId(req)` returns `req.user?.id ?? LEGACY_USER_ID`, so an install with auth disabled keeps working as a single-user app.
+- Channels have no `user_id` of their own; ownership comes from their playlist, so scoped channel queries join through `playlists`.
+- Cross-account access returns **404, not 403**, so a probe cannot confirm that someone else's id exists.
 - Multi-statement writes must go through `store.inTransaction(...)` so they cannot half-apply. Columns are snake_case, TypeScript objects stay camelCase, and each table has an explicit `rowTo*` mapper — no automatic name conversion.
 - Every mutable row carries a `version` column. It is incremented on write but **not yet enforced**; optimistic concurrency (`If-Match` / `ETag` / 409) is a later phase.
+- In-place schema changes go through `addColumnIfMissing()` near the top of `db.ts`, **not** the main `CREATE TABLE IF NOT EXISTS` batch: on a database whose tables already exist, that batch is a no-op, so anything referencing a new column (an index, especially) must run *after* the `ALTER TABLE`. Getting this order wrong fails only on upgrade, never on a fresh database — `verify:migration` covers it by opening a deliberately older-shaped database in a subprocess.
 - The previous store was a single JSON file, `data/db.json`, whose `readDb()`/`writeDb()` rewrote the whole document per mutation. `db.ts`'s `migrateFromJson()` imports it once on first boot when the database is empty, then leaves it alone as a rollback copy; `npm run verify:migration` re-checks that import field-for-field against a throwaway database. That migration also backfills `shortId`/`exportId`, which is why the old `migrateShortIds()` boot pass is gone — `short_id` is now `NOT NULL UNIQUE`.
 - Auth secrets live in a separate gitignored file, `data/auth.json`.
 - In dev (`NODE_ENV !== 'production'`), `server.ts` creates a Vite server in middleware mode and mounts it; in production it serves `dist/` statically with an `index.html` catch-all for client-side routing.
@@ -35,7 +40,7 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 
 `db.ts` is the source of truth for the backend types (`Playlist`, `Channel`, `EpgSource`, `ChannelPoolSource`, `ChannelPoolEntry`, `ChannelPoolChangeLog`); `server.ts` imports them. `src/apiClient.ts` still declares its own frontend copies — there's no shared types package, so when changing a shape update `db.ts` and `src/apiClient.ts`.
 
-- **`Playlist`** — has a `shortId` (small incrementing integer used in the public `/[shortId]` and `/[shortId]/epg` URLs) and an `exportId` (UUID, legacy long-form export route kept for backwards compatibility).
+- **`Playlist`** — has an `exportToken` (256-bit, URL-safe) used by the public `/e/:token` and `/e/:token/epg` export URLs and rotatable via `POST /api/playlists/:id/rotate-export-token`; a `shortId` (small incrementing integer, now only a display number — see the export-URL section below); and an `exportId` (UUID, legacy long-form export route kept for backwards compatibility).
 - **`Channel`** — belongs to one playlist + one category string; `order` drives manual drag-reordering.
 - **`EpgSource`** — an XMLTV URL (optionally gzip) or Xtream Codes credentials. Parsed programme/channel data is cached **in memory only** (`epgCache` Map keyed by source id) — it is never persisted, so it's rebuilt from scratch on every server restart via `refreshEpgSource()`, which runs for every stored source at boot and again on a 5-minute interval check against each source's `refreshIntervalHours`.
 - **`ChannelPoolSource` / `ChannelPoolEntry` / `ChannelPoolChangeLog`** — a separate "bulk source" concept, distinct from playlists: an Xtream account, a playlist URL, or an uploaded file that you browse and cherry-pick channels from into an actual playlist. Entries *are* persisted (the `channel_pool_entries` table, mirrored into an in-memory `channelPoolCache` for the running session). Each refresh diffs old vs. new entries by stream URL and appends an added/removed/renamed changelog entry, pruned to entries newer than 90 days.
@@ -50,7 +55,11 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 - The old store was a single global password in `data/auth.json` with an in-memory `activeSessions` Set. `db.ts`'s `migrateFromAuthJson()` converts it into the first account on boot, **reusing the existing PBKDF2 hashes so the same password keeps working**, with id `LEGACY_USER_ID` (`"local-user"`) so pre-existing playlists already belong to it. `M3U4ME_LEGACY_AUTH` overrides the path for tests.
 - The frontend stores the token in `sessionStorage` (`src/apiClient.ts`: `getSessionToken`/`setSessionToken`) and routes every call through `authFetch()`, which attaches `Authorization: Bearer …` and fires a global `auth-expired` window event on a 401 (handled in `App.tsx` to re-lock the UI via `LockScreen`).
 - `src/contexts/AuthContext.tsx` (`useAuth()`) is a **vestigial, unrelated stub** — it always returns a hardcoded dummy local user and has no connection to the password system above. Don't conflate the two when touching auth.
-- The short playlist/EPG URLs (`GET /:shortId`, `GET /:shortId/epg`) are registered outside the `/api` prefix and are therefore never auth-gated — intentional, since IPTV players/EPG grabbers hitting these can't supply a bearer token.
+- Public export URLs are registered outside the `/api` prefix and are therefore never auth-gated — intentional, since IPTV players/EPG grabbers can't supply a bearer token. Authorisation is instead the playlist's unguessable `exportToken`:
+  - `GET /e/:token` — the M3U.
+  - `GET /e/:token/epg` — the XMLTV document.
+  - `GET /:shortId` and `GET /:shortId/epg` are **disabled by default, returning 410 Gone.** `shortId` is a small incrementing integer, so with more than one account these enumerable, unauthenticated routes would expose every playlist — including stream URLs, which in IPTV routinely embed provider credentials. `ALLOW_INSECURE_SHORT_IDS=1` re-enables them (with a startup warning) for a migration window while players are repointed.
+  - `serveEpgXml()` filters the global `epgCache` to the playlist owner's EPG sources, so a shared tvg-id can't pull another account's programme data into the document.
 
 ### Frontend data flow: no query library — hand-rolled fetch + event bus
 

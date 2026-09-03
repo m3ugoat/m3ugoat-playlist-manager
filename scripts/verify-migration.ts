@@ -37,11 +37,12 @@ console.log("");
 
 // ── Counts ──────────────────────────────────────────────────────────────────
 
-const gotPlaylists = store.playlists.all();
-const gotChannels = store.channels.all();
-const gotEpg = store.epgSources.all();
-const gotPoolSrc = store.poolSources.all();
-const gotLogs = store.poolChangeLogs.all();
+const UID = store.LEGACY_USER_ID;
+const gotPlaylists = store.playlists.all(UID);
+const gotChannels = store.channels.allForUser(UID);
+const gotEpg = store.epgSources.all(UID);
+const gotPoolSrc = store.poolSources.all(UID);
+const gotLogs = store.poolChangeLogs.all(UID);
 const allEntries: any[] = [];
 for (const s of gotPoolSrc) allEntries.push(...store.poolEntries.bySource(s.id));
 
@@ -89,18 +90,42 @@ function compareSet(
 // isHidden was optional in the JSON store; SQLite always materialises it as a
 // boolean, so normalise both sides before comparing.
 const normChannel = (c: any) => ({ ...c, isHidden: !!c.isHidden });
+// exportToken is generated during the migration, so it has no JSON counterpart.
+const normPlaylist = (p: any) => {
+  const { exportToken, ...rest } = p;
+  return rest;
+};
+// Likewise userId: the source tables gained it when accounts were introduced,
+// and the migration stamps the legacy account onto pre-existing rows.
+const normSource = (x: any) => {
+  const { userId, ...rest } = x;
+  return rest;
+};
 
-compareSet("playlists", json.playlists ?? [], gotPlaylists);
+compareSet("playlists", json.playlists ?? [], gotPlaylists, normPlaylist);
 compareSet("channels", json.channels ?? [], gotChannels, normChannel);
-compareSet("epgSources", json.epgSources ?? [], gotEpg);
-compareSet("channelPoolSources", json.channelPoolSources ?? [], gotPoolSrc);
+compareSet("epgSources", json.epgSources ?? [], gotEpg, normSource);
+compareSet("channelPoolSources", json.channelPoolSources ?? [], gotPoolSrc, normSource);
 compareSet("channelPoolChangeLogs", json.channelPoolChangeLogs ?? [], gotLogs);
 compareSet("channelPoolEntries", json.channelPoolEntries ?? [], allEntries);
+
+check(
+  "every migrated playlist got an export token",
+  gotPlaylists.every((p) => typeof p.exportToken === "string" && p.exportToken.length >= 40),
+);
+check(
+  "migrated sources are owned by the legacy account",
+  [...gotEpg, ...gotPoolSrc].every((x: any) => x.userId === UID),
+);
+check(
+  "export tokens are unique",
+  new Set(gotPlaylists.map((p) => p.exportToken)).size === gotPlaylists.length,
+);
 
 // ── Ordering, which drag-reorder depends on ─────────────────────────────────
 
 for (const p of gotPlaylists) {
-  const orders = store.channels.byPlaylist(p.id).map((c) => c.order);
+  const orders = store.channels.byPlaylist(p.id, UID).map((c) => c.order);
   const ascending = orders.every((v, i) => i === 0 || orders[i - 1] <= v);
   check(`channel order ascending in "${p.name}"`, ascending);
 
@@ -116,11 +141,11 @@ for (const p of gotPlaylists) {
 
 const second = store.migrateFromJson();
 check("second run is a no-op", second.migrated === false);
-check("channel count unchanged after re-run", store.channels.all().length === gotChannels.length);
+check("channel count unchanged after re-run", store.channels.allForUser(UID).length === gotChannels.length);
 
 // ── Transaction rollback ────────────────────────────────────────────────────
 
-const before = store.channels.all().length;
+const before = store.channels.allForUser(UID).length;
 try {
   store.inTransaction(() => {
     const p = gotPlaylists[0];
@@ -144,7 +169,88 @@ try {
 } catch {
   /* expected */
 }
-check("failed transaction rolls back", store.channels.all().length === before);
+check("failed transaction rolls back", store.channels.allForUser(UID).length === before);
+
+// ── Upgrading an OLDER database in place ────────────────────────────────────
+//
+// The checks above all run against a database this process just created, which
+// means they exercise the CREATE TABLE path and never the ALTER TABLE path. A
+// real upgrade opens a database whose tables predate the newer columns — where
+// CREATE TABLE IF NOT EXISTS is a no-op — so it is tested separately, in its own
+// process (db.ts opens its connection at import time).
+
+const legacyShaped = path.join(scratch, "old-shape.db");
+{
+  const { DatabaseSync } = await import("node:sqlite");
+  const old = new DatabaseSync(legacyShaped);
+  // Tables exactly as an earlier phase created them: no user_id on the source
+  // tables, no export_token on playlists.
+  old.exec(`
+    CREATE TABLE playlists (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
+      categories TEXT NOT NULL DEFAULT '[]', export_id TEXT NOT NULL UNIQUE,
+      short_id INTEGER NOT NULL UNIQUE, version INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+    CREATE TABLE epg_sources (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, type TEXT NOT NULL,
+      xtream_username TEXT, xtream_password TEXT,
+      refresh_interval_hours INTEGER NOT NULL DEFAULT 12, last_fetched INTEGER,
+      last_fetch_error TEXT, channel_count INTEGER NOT NULL DEFAULT 0,
+      version INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL);
+    CREATE TABLE channel_pool_sources (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, url TEXT,
+      xtream_username TEXT, xtream_password TEXT,
+      refresh_interval_hours INTEGER NOT NULL DEFAULT 24, last_fetched INTEGER,
+      last_fetch_error TEXT, channel_count INTEGER NOT NULL DEFAULT 0,
+      version INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL);
+  `);
+  old.prepare(
+    `INSERT INTO playlists (id, user_id, name, categories, export_id, short_id, created_at, updated_at)
+     VALUES ('p-old', 'local-user', 'Pre-upgrade', '["General"]', 'exp-old', 1, 1, 1)`,
+  ).run();
+  old.prepare(
+    `INSERT INTO epg_sources (id, name, url, type, created_at, updated_at)
+     VALUES ('e-old', 'Old EPG', 'http://old.test/x.xml', 'xml', 1, 1)`,
+  ).run();
+  old.close();
+}
+
+const { spawnSync } = await import("child_process");
+const probe = spawnSync(
+  process.execPath,
+  [
+    "-e",
+    `const s = await import('${path.resolve("db.ts")}');
+     const p = s.playlists.all('local-user')[0];
+     const e = s.epgSources.all('local-user')[0];
+     console.log(JSON.stringify({
+       tokenLen: (p.exportToken || '').length,
+       name: p.name,
+       epgUserId: e ? e.userId : null,
+     }));`,
+  ],
+  {
+    env: { ...process.env, M3U4ME_DB_PATH: legacyShaped, M3U4ME_LEGACY_JSON: path.join(scratch, "none.json") },
+    encoding: "utf-8",
+  },
+);
+const upgraded = (() => {
+  try {
+    return JSON.parse((probe.stdout || "").trim().split("\n").pop() || "{}");
+  } catch {
+    return {};
+  }
+})();
+check(
+  "an older-shaped database opens without error",
+  probe.status === 0,
+  probe.status === 0 ? "" : (probe.stderr || "").split("\n").slice(0, 3).join(" | "),
+);
+check("upgrade backfills export_token on existing playlists", (upgraded.tokenLen ?? 0) >= 40, `len ${upgraded.tokenLen}`);
+check("upgrade preserves existing rows", upgraded.name === "Pre-upgrade", String(upgraded.name));
+check("upgrade defaults epg_sources.user_id to the legacy account", upgraded.epgUserId === "local-user", String(upgraded.epgUserId));
 
 fs.rmSync(scratch, { recursive: true, force: true });
 

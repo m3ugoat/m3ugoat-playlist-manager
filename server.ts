@@ -140,7 +140,8 @@ async function fetchAndParseEpg(source: EpgSource): Promise<{ channels: ParsedEp
 }
 
 async function refreshEpgSource(sourceId: string) {
-  const source = store.epgSources.byId(sourceId);
+  // Background refresh: runs for every account, so it is deliberately unscoped.
+  const source = store.epgSources.byIdUnscoped(sourceId);
   if (!source) return;
   try {
     const data = await fetchAndParseEpg(source);
@@ -342,7 +343,7 @@ function keyEntriesByUrlOccurrence(entries: ChannelPoolEntry[]): Map<string, Cha
 /** Diffs old vs. new entries and logs the changes. Returns whether anything actually changed. */
 function detectChannelPoolChanges(sourceId: string, newEntries: ChannelPoolEntry[]): boolean {
   const oldEntries = store.poolEntries.bySource(sourceId);
-  const source = store.poolSources.byId(sourceId);
+  const source = store.poolSources.byIdUnscoped(sourceId);
 
   if (!oldEntries.length) {
     store.inTransaction(() => store.poolEntries.replaceForSource(sourceId, newEntries));
@@ -397,7 +398,8 @@ function detectChannelPoolChanges(sourceId: string, newEntries: ChannelPoolEntry
 
 /** Refreshes a Channel Pool source's entries. Returns whether the entries actually changed. */
 async function refreshChannelPoolSource(sourceId: string): Promise<boolean> {
-  const source = store.poolSources.byId(sourceId);
+  // Background refresh: unscoped for the same reason as refreshEpgSource.
+  const source = store.poolSources.byIdUnscoped(sourceId);
   if (!source || source.type === 'playlist-file') return false;
 
   try {
@@ -448,6 +450,18 @@ const PBKDF2_DIGEST = 'sha512';
 const authMigration = store.migrateFromAuthJson();
 if (authMigration.migrated) {
   console.log(`Migrated data/auth.json into the users table as "${authMigration.username}".`);
+}
+
+/**
+ * The account a request acts as.
+ *
+ * When authentication is disabled (no accounts exist at all) there is no
+ * req.user, so requests fall back to the legacy account — which owns all
+ * pre-existing data. That keeps a single-user install behaving exactly as it
+ * did before accounts were introduced, while every query stays scoped.
+ */
+function actingUserId(req: express.Request): string {
+  return req.user?.id ?? store.LEGACY_USER_ID;
 }
 
 /** Bearer tokens are stored only as SHA-256, so the database holds no usable credential. */
@@ -555,7 +569,7 @@ function escapeCData(value: string): string {
 function serveM3U(playlist: Playlist, res: any) {
   const catIndex = new Map(playlist.categories.map((cat, i) => [cat, i]));
   const channels = store.channels
-    .byPlaylist(playlist.id)
+    .byPlaylistForExport(playlist.id)
     .filter(c => !c.isHidden)
     .sort((a, b) => {
       const catA = catIndex.has(a.category) ? catIndex.get(a.category)! : playlist.categories.length;
@@ -586,9 +600,9 @@ async function startServer() {
   // Initialize EPG Cache. Refreshed one source at a time (not all at once) —
   // see refreshEpgSourcesSequentially. This is fired without awaiting so it
   // doesn't delay the server from listening.
-  refreshEpgSourcesSequentially(store.epgSources.all().map(s => s.id));
+  refreshEpgSourcesSequentially(store.epgSources.allUnscoped().map(s => s.id));
   const channelPoolSourceIdsToRefresh: string[] = [];
-  for (const source of store.poolSources.all()) {
+  for (const source of store.poolSources.allUnscoped()) {
     if (source.type !== 'playlist-file') {
       channelPoolSourceIdsToRefresh.push(source.id);
     } else {
@@ -607,7 +621,7 @@ async function startServer() {
     // A source whose last attempt failed is retried on every tick (regardless
     // of its refresh interval) until it succeeds, instead of silently sitting
     // empty until the interval next comes due.
-    const dueEpgSourceIds = store.epgSources.all().filter(source => {
+    const dueEpgSourceIds = store.epgSources.allUnscoped().filter(source => {
       const intervalMs = (source.refreshIntervalHours || 12) * 60 * 60 * 1000;
       return !source.lastFetched || source.lastFetchError || (now - source.lastFetched) > intervalMs;
     }).map(source => source.id);
@@ -616,7 +630,7 @@ async function startServer() {
     // above), instead of silently sitting on stale/empty data until the interval next
     // comes due — which for the default 24h channel-pool interval could otherwise mean
     // a whole day before an invalid-login error is retried after being fixed.
-    const dueChannelPoolSourceIds = store.poolSources.all().filter(source => {
+    const dueChannelPoolSourceIds = store.poolSources.allUnscoped().filter(source => {
       if (source.type === 'playlist-file') return false;
       const intervalMs = (source.refreshIntervalHours || 24) * 60 * 60 * 1000;
       return !source.lastFetched || source.lastFetchError || (now - source.lastFetched) > intervalMs;
@@ -924,13 +938,14 @@ async function startServer() {
 
   // ── EPG Routes ───────────────────────────────────────────────────────
   app.get("/api/epg-sources", (req, res) => {
-    res.json(store.epgSources.all());
+    res.json(store.epgSources.all(actingUserId(req)));
   });
 
   app.post("/api/epg-sources", async (req, res) => {
     const newSource: EpgSource = {
       id: uuidv4(),
       ...req.body,
+      userId: actingUserId(req),
       refreshIntervalHours: req.body.refreshIntervalHours ?? 12,
       lastFetched: null,
       lastFetchError: null,
@@ -940,10 +955,14 @@ async function startServer() {
     };
     store.epgSources.insert(newSource);
     await refreshEpgSource(newSource.id);
-    res.json(store.epgSources.byId(newSource.id) ?? newSource);
+    res.json(store.epgSources.byId(newSource.id, actingUserId(req)) ?? newSource);
   });
 
   app.put("/api/epg-sources/:id", (req, res) => {
+    // Ownership first: an unscoped update() would otherwise edit another account's source.
+    if (!store.epgSources.byId(req.params.id, actingUserId(req))) {
+      return res.status(404).json({ error: "Not found" });
+    }
     const updated = store.epgSources.update(req.params.id, req.body);
     if (updated) {
       res.json(updated);
@@ -953,7 +972,9 @@ async function startServer() {
   });
 
   app.delete("/api/epg-sources/:id", (req, res) => {
-    store.epgSources.delete(req.params.id);
+    if (!store.epgSources.delete(req.params.id, actingUserId(req))) {
+      return res.status(404).json({ error: "Not found" });
+    }
     epgCache.delete(req.params.id);
     res.json({ success: true });
   });
@@ -965,7 +986,7 @@ async function startServer() {
   });
 
   app.get("/api/epg-sources/:id/channels", (req, res) => {
-    const source = store.epgSources.byId(req.params.id);
+    const source = store.epgSources.byId(req.params.id, actingUserId(req));
     if (!source) return res.status(404).json({ error: "Not found" });
     const cache = epgCache.get(req.params.id);
     if (!cache) return res.json([]);
@@ -1022,7 +1043,7 @@ async function startServer() {
     if (!q) return res.json([]);
     
     const results = [];
-    const dbSources = store.epgSources.all();
+    const dbSources = store.epgSources.all(actingUserId(req));
     
     for (const [sourceId, cache] of epgCache.entries()) {
       const source = dbSources.find(s => s.id === sourceId);
@@ -1043,7 +1064,7 @@ async function startServer() {
     const { ids } = req.body as { ids: string[] };
     if (!ids || !Array.isArray(ids)) return res.json({});
     
-    const dbSources = store.epgSources.all();
+    const dbSources = store.epgSources.all(actingUserId(req));
     const result: Record<string, { displayName: string; sourceName: string }> = {};
     
     // Build a lookup set for fast matching
@@ -1064,7 +1085,7 @@ async function startServer() {
 
   // ── Channel Pool Routes ───────────────────────────────────────────────────────
   app.get("/api/channel-pool/sources", (req, res) => {
-    res.json(store.poolSources.all());
+    res.json(store.poolSources.all(actingUserId(req)));
   });
 
   app.post("/api/channel-pool/validate-url", async (req, res) => {
@@ -1127,6 +1148,7 @@ async function startServer() {
     const newSource: ChannelPoolSource = {
       id: uuidv4(),
       ...req.body,
+      userId: actingUserId(req),
       refreshIntervalHours: req.body.refreshIntervalHours ?? 24,
       lastFetched: null,
       lastFetchError: null,
@@ -1139,10 +1161,13 @@ async function startServer() {
     if (newSource.type !== 'playlist-file') {
       await refreshChannelPoolSource(newSource.id);
     }
-    res.json(store.poolSources.byId(newSource.id) || newSource);
+    res.json(store.poolSources.byId(newSource.id, actingUserId(req)) || newSource);
   });
 
   app.put("/api/channel-pool/sources/:id", (req, res) => {
+    if (!store.poolSources.byId(req.params.id, actingUserId(req))) {
+      return res.status(404).json({ error: "Not found" });
+    }
     const updated = store.poolSources.update(req.params.id, req.body);
     if (updated) {
       res.json(updated);
@@ -1152,23 +1177,32 @@ async function startServer() {
   });
 
   app.delete("/api/channel-pool/sources/:id", (req, res) => {
+    const userId = actingUserId(req);
+    if (!store.poolSources.byId(req.params.id, userId)) {
+      return res.status(404).json({ error: "Not found" });
+    }
     store.inTransaction(() => {
       // Entries cascade from the source row; changelogs are cleared explicitly.
       store.poolChangeLogs.deleteBySource(req.params.id);
-      store.poolSources.delete(req.params.id);
+      store.poolSources.delete(req.params.id, userId);
     });
     channelPoolCache.delete(req.params.id);
     res.json({ success: true });
   });
 
   app.post("/api/channel-pool/sources/:id/refresh", async (req, res) => {
+    // Ownership is checked before the refresh so this cannot be used to make
+    // the server fetch on behalf of another account's source.
+    if (!store.poolSources.byId(req.params.id, actingUserId(req))) {
+      return res.status(404).json({ error: "Not found" });
+    }
     const changed = await refreshChannelPoolSource(req.params.id);
-    const source = store.poolSources.byId(req.params.id);
+    const source = store.poolSources.byId(req.params.id, actingUserId(req));
     res.json({ success: true, channelCount: source?.channelCount || 0, changed });
   });
 
   app.get("/api/channel-pool/sources/:id/channels", (req, res) => {
-    const source = store.poolSources.byId(req.params.id);
+    const source = store.poolSources.byId(req.params.id, actingUserId(req));
     if (!source) return res.status(404).json({ error: "Not found" });
 
     let entries = channelPoolCache.get(req.params.id) || store.poolEntries.bySource(req.params.id);
@@ -1191,6 +1225,11 @@ async function startServer() {
   });
 
   app.get("/api/channel-pool/sources/:id/categories", (req, res) => {
+    // The cache is keyed by source id across all accounts, so ownership must be
+    // confirmed before serving from it.
+    if (!store.poolSources.byId(req.params.id, actingUserId(req))) {
+      return res.status(404).json({ error: "Not found" });
+    }
     const entries = channelPoolCache.get(req.params.id) || store.poolEntries.bySource(req.params.id);
     
     const categories = new Set(entries.map(e => e.category));
@@ -1202,7 +1241,7 @@ async function startServer() {
     const page = Math.max(1, parseInt(String(req.query.page), 10) || 1);
     const perPage = 20;
 
-    const logs = store.poolChangeLogs.all();
+    const logs = store.poolChangeLogs.all(actingUserId(req));
     const total = logs.length;
     const paginatedLogs = logs.slice((page - 1) * perPage, page * perPage);
     
@@ -1221,6 +1260,7 @@ async function startServer() {
     
     const newSource: ChannelPoolSource = {
       id: uuidv4(),
+      userId: actingUserId(req),
       name,
       type: 'playlist-file',
       url: null,
@@ -1262,7 +1302,7 @@ async function startServer() {
   });
 
   app.get("/api/playlists", (req, res) => {
-    res.json(store.playlists.all());
+    res.json(store.playlists.all(actingUserId(req)));
   });
 
   app.post("/api/playlists", (req, res) => {
@@ -1271,10 +1311,11 @@ async function startServer() {
     const newPlaylist: Playlist = {
       id: uuidv4(),
       name: name || "Unnamed Playlist",
-      userId: "local-user",
+      userId: actingUserId(req),
       categories: ["General"],
       exportId: uuidv4(),
       shortId: nextShortId,
+      exportToken: store.newExportToken(),
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -1345,10 +1386,11 @@ async function startServer() {
     const newPlaylist: Playlist = {
       id: uuidv4(),
       name: String(name).trim(),
-      userId: "local-user",
+      userId: actingUserId(req),
       categories: categories.length > 0 ? categories : ["General"],
       exportId: uuidv4(),
       shortId: nextShortId,
+      exportToken: store.newExportToken(),
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -1379,7 +1421,8 @@ async function startServer() {
 
   app.put("/api/playlists/:playlistId", (req, res) => {
     const { playlistId } = req.params;
-    if (!store.playlists.byId(playlistId)) {
+    const userId = actingUserId(req);
+    if (!store.playlists.byId(playlistId, userId)) {
       return res.status(404).json({ error: "Not found" });
     }
     if (Array.isArray(req.body.categories)) {
@@ -1393,23 +1436,41 @@ async function startServer() {
       }
       req.body.categories = trimmed;
     }
-    const updated = store.playlists.update(playlistId, req.body);
+    const updated = store.playlists.update(playlistId, userId, req.body);
     res.json(updated);
+  });
+
+  // Invalidates the current /e/:token export link and issues a new one — how you
+  // revoke a link that has leaked.
+  app.post("/api/playlists/:playlistId/rotate-export-token", (req, res) => {
+    const token = store.playlists.rotateExportToken(req.params.playlistId, actingUserId(req));
+    if (!token) return res.status(404).json({ error: "Not found" });
+    res.json({ exportToken: token });
   });
 
   app.delete("/api/playlists/:playlistId", (req, res) => {
     // Channels are removed by the ON DELETE CASCADE on channels.playlist_id.
-    store.playlists.delete(req.params.playlistId);
+    if (!store.playlists.delete(req.params.playlistId, actingUserId(req))) {
+      return res.status(404).json({ error: "Not found" });
+    }
     res.json({ success: true });
   });
 
   app.get("/api/playlists/:playlistId/channels", (req, res) => {
-    res.json(store.channels.byPlaylist(req.params.playlistId));
+    const userId = actingUserId(req);
+    if (!store.playlists.byId(req.params.playlistId, userId)) {
+      return res.status(404).json({ error: "Not found" });
+    }
+    res.json(store.channels.byPlaylist(req.params.playlistId, userId));
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk", (req, res) => {
     const { playlistId } = req.params;
     const { channels } = req.body;
+    const userId = actingUserId(req);
+    if (!store.playlists.byId(playlistId, userId)) {
+      return res.status(404).json({ error: "Not found" });
+    }
 
     // Auto increment order
     const maxOrder = store.channels.maxOrder(playlistId);
@@ -1437,7 +1498,7 @@ async function startServer() {
       store.channels.insertMany(newChannels);
 
       // Update categories — preserve existing order, append new ones at the end
-      const playlist = store.playlists.byId(playlistId);
+      const playlist = store.playlists.byId(playlistId, userId);
       if (playlist) {
         const categories = [...playlist.categories];
         const existingSet = new Set(categories);
@@ -1448,7 +1509,7 @@ async function startServer() {
           }
         });
         if (categories.length !== playlist.categories.length) {
-          store.playlists.update(playlistId, { categories });
+          store.playlists.update(playlistId, userId, { categories });
         }
       }
     });
@@ -1457,7 +1518,7 @@ async function startServer() {
   });
 
   app.put("/api/playlists/:playlistId/channels/:channelId", (req, res) => {
-    const updated = store.channels.update(req.params.channelId, req.body);
+    const updated = store.channels.update(req.params.channelId, actingUserId(req), req.body);
     if (updated) {
       res.json(updated);
     } else {
@@ -1466,25 +1527,31 @@ async function startServer() {
   });
 
   app.delete("/api/playlists/:playlistId/channels/:channelId", (req, res) => {
-    store.channels.delete(req.params.channelId);
+    if (!store.channels.delete(req.params.channelId, actingUserId(req))) {
+      return res.status(404).json({ error: "Not found" });
+    }
     res.json({ success: true });
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk-update", (req, res) => {
     const { playlistId } = req.params;
     const { ids, updates } = req.body;
+    const userId = actingUserId(req);
+    if (!store.playlists.byId(playlistId, userId)) {
+      return res.status(404).json({ error: "Not found" });
+    }
 
     store.inTransaction(() => {
       const idSet = new Set<string>(ids ?? []);
-      for (const c of store.channels.byPlaylist(playlistId)) {
-        if (idSet.has(c.id)) store.channels.update(c.id, updates);
+      for (const c of store.channels.byPlaylist(playlistId, userId)) {
+        if (idSet.has(c.id)) store.channels.update(c.id, userId, updates);
       }
 
       // Handle new category dynamic pushing
       if (updates.category) {
-        const playlist = store.playlists.byId(playlistId);
+        const playlist = store.playlists.byId(playlistId, userId);
         if (playlist && !playlist.categories.includes(updates.category)) {
-          store.playlists.update(playlistId, {
+          store.playlists.update(playlistId, userId, {
             categories: [...playlist.categories, updates.category],
           });
         }
@@ -1498,13 +1565,17 @@ async function startServer() {
     const { playlistId } = req.params;
     const { updates } = req.body; // updates: Array<{ id: string, changes: any }>
 
+    const userId = actingUserId(req);
+    if (!store.playlists.byId(playlistId, userId)) {
+      return res.status(404).json({ error: "Not found" });
+    }
     const updateMap = new Map<string, any>(updates.map((u: any) => [u.id, u.changes]));
 
     store.inTransaction(() => {
-      const playlist = store.playlists.byId(playlistId);
+      const playlist = store.playlists.byId(playlistId, userId);
       const categories = playlist ? [...playlist.categories] : [];
 
-      for (const c of store.channels.byPlaylist(playlistId)) {
+      for (const c of store.channels.byPlaylist(playlistId, userId)) {
         if (!updateMap.has(c.id)) continue;
         const changes = updateMap.get(c.id);
 
@@ -1512,11 +1583,11 @@ async function startServer() {
         if (changes.category && !categories.includes(changes.category)) {
           categories.push(changes.category);
         }
-        store.channels.update(c.id, changes);
+        store.channels.update(c.id, userId, changes);
       }
 
       if (playlist && categories.length !== playlist.categories.length) {
-        store.playlists.update(playlistId, { categories });
+        store.playlists.update(playlistId, userId, { categories });
       }
     });
 
@@ -1529,18 +1600,22 @@ async function startServer() {
     if (!search || typeof search !== "string") {
       return res.status(400).json({ error: "Missing search string" });
     }
+    const userId = actingUserId(req);
+    if (!store.playlists.byId(playlistId, userId)) {
+      return res.status(404).json({ error: "Not found" });
+    }
     const targetField = field || "url";
     let modified = 0;
 
     store.inTransaction(() => {
-      for (const c of store.channels.byPlaylist(playlistId)) {
+      for (const c of store.channels.byPlaylist(playlistId, userId)) {
         if (ids && Array.isArray(ids) && !ids.includes(c.id)) continue;
         const current = (c as any)[targetField];
         if (typeof current !== "string" || !current.includes(search)) continue;
         const updated = current.replaceAll(search, replace ?? "");
         if (updated === current) continue;
         modified++;
-        store.channels.update(c.id, { [targetField]: updated } as Partial<Channel>);
+        store.channels.update(c.id, userId, { [targetField]: updated } as Partial<Channel>);
       }
     });
 
@@ -1550,23 +1625,31 @@ async function startServer() {
   app.post("/api/playlists/:playlistId/channels/bulk-delete", (req, res) => {
     const { playlistId } = req.params;
     const { ids } = req.body;
+    const userId = actingUserId(req);
+    if (!store.playlists.byId(playlistId, userId)) {
+      return res.status(404).json({ error: "Not found" });
+    }
     // Scoped to the playlist, matching the previous filter.
     const idSet = new Set<string>(ids ?? []);
     const toDelete = store.channels
-      .byPlaylist(playlistId)
+      .byPlaylist(playlistId, userId)
       .filter(c => idSet.has(c.id))
       .map(c => c.id);
-    store.inTransaction(() => store.channels.deleteMany(toDelete));
+    store.inTransaction(() => store.channels.deleteMany(toDelete, userId));
     res.json({ success: true });
   });
 
   app.post("/api/playlists/:playlistId/channels/reorder", (req, res) => {
     const { playlistId } = req.params;
     const { orders } = req.body; // { id: newOrder }
+    const userId = actingUserId(req);
+    if (!store.playlists.byId(playlistId, userId)) {
+      return res.status(404).json({ error: "Not found" });
+    }
     // One transaction for the whole reorder, so a drag can't half-apply.
     store.inTransaction(() => {
       const now = Date.now();
-      for (const c of store.channels.byPlaylist(playlistId)) {
+      for (const c of store.channels.byPlaylist(playlistId, userId)) {
         if (orders[c.id] !== undefined) store.channels.setOrder(c.id, orders[c.id], now);
       }
     });
@@ -1618,10 +1701,11 @@ async function startServer() {
   app.get("/api/search", (req, res) => {
     const q = String(req.query.q || '').trim().toLowerCase();
     if (!q) return res.json([]);
-    const allPlaylists = store.playlists.all();
-    const allChannels = store.channels.all();
-    const allPoolSources = store.poolSources.all();
-    const allEpgSources = store.epgSources.all();
+    const userId = actingUserId(req);
+    const allPlaylists = store.playlists.all(userId);
+    const allChannels = store.channels.allForUser(userId);
+    const allPoolSources = store.poolSources.all(userId);
+    const allEpgSources = store.epgSources.all(userId);
     const matches = (...fields: (string | null | undefined)[]) => fields.some(f => f?.toLowerCase().includes(q));
 
     const playlistResults = allChannels
@@ -1685,7 +1769,7 @@ async function startServer() {
 
   // Legacy long-form URL (kept for backwards compatibility)
   app.get("/api/playlists/:exportId.m3u", (req, res) => {
-    const playlist = store.playlists.byExportId(req.params.exportId);
+    const playlist = store.playlists.byExportId(req.params.exportId, actingUserId(req));
     if (!playlist) return res.status(404).send("Playlist not found");
     serveM3U(playlist, res);
   });
@@ -1705,21 +1789,23 @@ async function startServer() {
     }
   });
 
-  // EPG XMLTV Server
-  app.get(/^\/(\d+)\/epg$/, (req, res) => {
-    const shortId = parseInt(req.params[0], 10);
-    const playlist = store.playlists.byShortId(shortId);
-    if (!playlist) return res.status(404).send("Playlist not found");
-
+  // Builds the XMLTV document for one playlist. Shared by the token export
+  // route and the legacy short-id route.
+  function serveEpgXml(playlist: Playlist, res: any) {
     const channels = store.channels
-      .byPlaylist(playlist.id)
+      .byPlaylistForExport(playlist.id)
       .filter(c => !c.isHidden && c.tvgId);
     const tvgIds = new Set(channels.map(c => c.tvgId));
+    // epgCache is global and keyed by source id, so it has to be filtered to the
+    // playlist owner's sources — otherwise a matching tvg-id would pull another
+    // account's programme data into this document.
+    const ownSourceIds = new Set(store.epgSources.all(playlist.userId).map(src => src.id));
 
     res.setHeader("Content-Type", "application/xml");
     let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="m3u4me">\n`;
     
-    for (const cache of epgCache.values()) {
+    for (const [sourceId, cache] of epgCache.entries()) {
+      if (!ownSourceIds.has(sourceId)) continue;
       for (const c of cache.channels) {
         if (tvgIds.has(c.id)) {
           xml += `  <channel id="${escapeXmlAttr(c.id)}">\n`;
@@ -1741,15 +1827,59 @@ async function startServer() {
     }
     xml += `</tv>`;
     res.send(xml);
-  });
+  }
 
-  // Short numeric URL: /1  /2  /3 …
-  app.get(/^\/(\d+)$/, (req, res) => {
-    const shortId = parseInt(req.params[0], 10);
-    const playlist = store.playlists.byShortId(shortId);
+  // ── Public export URLs ────────────────────────────────────────────────
+  //
+  // These are the only routes IPTV players and EPG grabbers can use, since
+  // those clients cannot send a bearer token. Authorisation is therefore the
+  // unguessable per-playlist export token (256 bits), which the owner can
+  // rotate to invalidate a leaked link.
+  app.get("/e/:token", (req, res) => {
+    const playlist = store.playlists.byExportToken(req.params.token);
     if (!playlist) return res.status(404).send("Playlist not found");
     serveM3U(playlist, res);
   });
+
+  app.get("/e/:token/epg", (req, res) => {
+    const playlist = store.playlists.byExportToken(req.params.token);
+    if (!playlist) return res.status(404).send("Playlist not found");
+    serveEpgXml(playlist, res);
+  });
+
+  // Legacy short numeric URLs: /1  /2  /3 …
+  //
+  // OFF BY DEFAULT. shortId is a small incrementing integer and these routes
+  // are necessarily unauthenticated, so with more than one account anyone on
+  // the network could walk /1, /2, /3 … and read every playlist — including
+  // stream URLs, which in IPTV routinely embed the provider's credentials.
+  // Set ALLOW_INSECURE_SHORT_IDS=1 to re-enable them for a migration window
+  // while players are repointed at their /e/:token URLs.
+  const allowShortIds = process.env.ALLOW_INSECURE_SHORT_IDS === '1';
+  if (allowShortIds) {
+    console.warn(
+      'ALLOW_INSECURE_SHORT_IDS=1: /:shortId playlist URLs are enabled and are ' +
+        'unauthenticated and enumerable. Repoint players at their /e/:token URL and unset this.',
+    );
+  }
+
+  const shortIdRoute = (handler: (playlist: Playlist, res: any) => void) =>
+    (req: express.Request, res: express.Response) => {
+      if (!allowShortIds) {
+        return res
+          .status(410)
+          .send(
+            'Numeric playlist URLs are disabled because they are enumerable. Use the ' +
+              "playlist's /e/<token> export URL instead, or set ALLOW_INSECURE_SHORT_IDS=1.",
+          );
+      }
+      const playlist = store.playlists.byShortIdUnscoped(parseInt(req.params[0], 10));
+      if (!playlist) return res.status(404).send("Playlist not found");
+      handler(playlist, res);
+    };
+
+  app.get(/^\/(\d+)\/epg$/, shortIdRoute(serveEpgXml));
+  app.get(/^\/(\d+)$/, shortIdRoute(serveM3U));
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {

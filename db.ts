@@ -19,7 +19,7 @@
 //     (If-Match / 409) arrives in a later phase.
 
 import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "crypto";
+import { randomUUID, randomBytes } from "crypto";
 import path from "path";
 import fs from "fs";
 
@@ -41,6 +41,8 @@ export interface Playlist {
   categories: string[];
   exportId: string;
   shortId: number;
+  /** Secret used by the public /e/:token export URLs. Rotatable. */
+  exportToken: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -61,6 +63,7 @@ export interface Channel {
 
 export interface EpgSource {
   id: string;
+  userId: string;
   name: string;
   url: string;
   type: "xml" | "xtream";
@@ -75,6 +78,7 @@ export interface EpgSource {
 
 export interface ChannelPoolSource {
   id: string;
+  userId: string;
   name: string;
   type: "xtream" | "playlist-url" | "playlist-file";
   url: string | null;
@@ -147,6 +151,8 @@ db.exec(`
     categories  TEXT NOT NULL DEFAULT '[]',
     export_id   TEXT NOT NULL UNIQUE,
     short_id    INTEGER NOT NULL UNIQUE,
+    -- Unguessable, rotatable secret for the public /e/:token export URLs.
+    export_token TEXT UNIQUE,
     version     INTEGER NOT NULL DEFAULT 1,
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
@@ -169,6 +175,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS epg_sources (
     id                    TEXT PRIMARY KEY,
+    user_id               TEXT NOT NULL DEFAULT 'local-user',
     name                  TEXT NOT NULL,
     url                   TEXT NOT NULL,
     type                  TEXT NOT NULL,
@@ -185,6 +192,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS channel_pool_sources (
     id                    TEXT PRIMARY KEY,
+    user_id               TEXT NOT NULL DEFAULT 'local-user',
     name                  TEXT NOT NULL,
     type                  TEXT NOT NULL,
     url                   TEXT,
@@ -247,6 +255,10 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);
+  -- The user_id indexes for epg_sources and channel_pool_sources are created in
+  -- the migration section below, not here: on a database that predates those
+  -- columns, CREATE TABLE IF NOT EXISTS is a no-op and indexing a column that
+  -- does not exist yet fails the whole batch.
   CREATE INDEX IF NOT EXISTS idx_playlists_user      ON playlists(user_id);
   CREATE INDEX IF NOT EXISTS idx_channels_playlist   ON channels(playlist_id, sort_order);
   CREATE INDEX IF NOT EXISTS idx_channels_tvg        ON channels(tvg_id);
@@ -254,6 +266,39 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pool_entries_cat    ON channel_pool_entries(source_id, category);
   CREATE INDEX IF NOT EXISTS idx_pool_logs_source    ON channel_pool_change_logs(source_id, timestamp);
 `);
+
+// ── In-place schema migration ───────────────────────────────────────────────
+//
+// CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+// databases created by an earlier phase need their new columns added. Both are
+// idempotent and cheap enough to run on every boot.
+
+function addColumnIfMissing(table: string, column: string, ddl: string) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+}
+
+// Existing rows predate multi-user, so they belong to the legacy account.
+addColumnIfMissing("epg_sources", "user_id", "user_id TEXT NOT NULL DEFAULT 'local-user'");
+addColumnIfMissing("channel_pool_sources", "user_id", "user_id TEXT NOT NULL DEFAULT 'local-user'");
+// Nullable + a unique index rather than NOT NULL UNIQUE: ALTER TABLE cannot add
+// a unique column with a constant default without every row colliding.
+addColumnIfMissing("playlists", "export_token", "export_token TEXT");
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_export_token ON playlists(export_token)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_epg_sources_user  ON epg_sources(user_id)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_pool_sources_user ON channel_pool_sources(user_id)");
+
+/** 256 bits, URL-safe — the secret in a public export link. */
+export function newExportToken(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+// Backfill playlists that predate export_token.
+for (const r of db.prepare("SELECT id FROM playlists WHERE export_token IS NULL").all() as Row[]) {
+  db.prepare("UPDATE playlists SET export_token = ? WHERE id = ?").run(newExportToken(), r.id);
+}
 
 // ── Row mappers ─────────────────────────────────────────────────────────────
 
@@ -277,6 +322,7 @@ function rowToPlaylist(r: Row): Playlist {
     categories: parseJson<string[]>(r.categories, []),
     exportId: r.export_id,
     shortId: r.short_id,
+    exportToken: r.export_token,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -307,6 +353,7 @@ function credsFrom(r: Row) {
 function rowToEpgSource(r: Row): EpgSource {
   const s: EpgSource = {
     id: r.id,
+    userId: r.user_id,
     name: r.name,
     url: r.url,
     type: r.type,
@@ -325,6 +372,7 @@ function rowToEpgSource(r: Row): EpgSource {
 function rowToPoolSource(r: Row): ChannelPoolSource {
   const s: ChannelPoolSource = {
     id: r.id,
+    userId: r.user_id,
     name: r.name,
     type: r.type,
     url: r.url ?? null,
@@ -390,29 +438,51 @@ export function inTransaction<T>(fn: () => T): T {
 // ── Playlists ───────────────────────────────────────────────────────────────
 
 export const playlists = {
-  all(): Playlist[] {
-    return db.prepare("SELECT * FROM playlists ORDER BY short_id").all().map(rowToPlaylist);
+  /**
+   * Every read and write is scoped by userId. Passing the owner in explicitly
+   * (rather than filtering at the route) means a missing scope is a type error
+   * rather than a silent cross-account leak.
+   */
+  all(userId: string): Playlist[] {
+    return db
+      .prepare("SELECT * FROM playlists WHERE user_id = ? ORDER BY short_id")
+      .all(userId)
+      .map(rowToPlaylist);
   },
-  byId(id: string): Playlist | null {
-    const r = db.prepare("SELECT * FROM playlists WHERE id = ?").get(id);
+  byId(id: string, userId: string): Playlist | null {
+    const r = db.prepare("SELECT * FROM playlists WHERE id = ? AND user_id = ?").get(id, userId);
     return r ? rowToPlaylist(r as Row) : null;
   },
-  byShortId(shortId: number): Playlist | null {
+  /** Public export lookup: the token is the credential, so this is not scoped. */
+  byExportToken(token: string): Playlist | null {
+    const r = db.prepare("SELECT * FROM playlists WHERE export_token = ?").get(token);
+    return r ? rowToPlaylist(r as Row) : null;
+  },
+  /**
+   * Unscoped shortId lookup, only for the legacy /:shortId routes. shortId is a
+   * small incrementing integer, so this is enumerable across accounts — the
+   * caller must gate it (see ALLOW_INSECURE_SHORT_IDS in server.ts).
+   */
+  byShortIdUnscoped(shortId: number): Playlist | null {
     const r = db.prepare("SELECT * FROM playlists WHERE short_id = ?").get(shortId);
     return r ? rowToPlaylist(r as Row) : null;
   },
-  byExportId(exportId: string): Playlist | null {
-    const r = db.prepare("SELECT * FROM playlists WHERE export_id = ?").get(exportId);
+  byExportId(exportId: string, userId: string): Playlist | null {
+    const r = db
+      .prepare("SELECT * FROM playlists WHERE export_id = ? AND user_id = ?")
+      .get(exportId, userId);
     return r ? rowToPlaylist(r as Row) : null;
   },
+  /** shortId stays globally unique so the legacy URLs keep working. */
   nextShortId(): number {
     const r = db.prepare("SELECT COALESCE(MAX(short_id), 0) + 1 AS next FROM playlists").get() as Row;
     return r.next;
   },
   insert(p: Playlist): void {
     db.prepare(
-      `INSERT INTO playlists (id, user_id, name, categories, export_id, short_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO playlists
+         (id, user_id, name, categories, export_id, short_id, export_token, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       p.id,
       p.userId,
@@ -420,41 +490,86 @@ export const playlists = {
       JSON.stringify(p.categories ?? []),
       p.exportId,
       p.shortId,
+      p.exportToken || newExportToken(),
       p.createdAt,
       p.updatedAt,
     );
   },
-  update(id: string, patch: Partial<Playlist>): Playlist | null {
-    const current = this.byId(id);
+  update(id: string, userId: string, patch: Partial<Playlist>): Playlist | null {
+    const current = this.byId(id, userId);
     if (!current) return null;
     const next = { ...current, ...patch, updatedAt: Date.now() };
     db.prepare(
       `UPDATE playlists
           SET name = ?, categories = ?, updated_at = ?, version = version + 1
-        WHERE id = ?`,
-    ).run(next.name, JSON.stringify(next.categories ?? []), next.updatedAt, id);
+        WHERE id = ? AND user_id = ?`,
+    ).run(next.name, JSON.stringify(next.categories ?? []), next.updatedAt, id, userId);
     return next;
   },
-  delete(id: string): void {
+  /** Invalidates any export link already handed out for this playlist. */
+  rotateExportToken(id: string, userId: string): string | null {
+    const token = newExportToken();
+    const changed = db
+      .prepare(
+        "UPDATE playlists SET export_token = ?, updated_at = ?, version = version + 1 WHERE id = ? AND user_id = ?",
+      )
+      .run(token, Date.now(), id, userId).changes as number;
+    return changed > 0 ? token : null;
+  },
+  delete(id: string, userId: string): boolean {
     // channels cascade via the foreign key
-    db.prepare("DELETE FROM playlists WHERE id = ?").run(id);
+    return (
+      (db.prepare("DELETE FROM playlists WHERE id = ? AND user_id = ?").run(id, userId)
+        .changes as number) > 0
+    );
   },
 };
 
 // ── Channels ────────────────────────────────────────────────────────────────
 
 export const channels = {
-  all(): Channel[] {
-    return db.prepare("SELECT * FROM channels").all().map(rowToChannel);
+  // Channels have no user_id of their own — ownership comes from their
+  // playlist, so every scoped query joins through it. `OWNED` is that join.
+  // Anything reachable by id must use it, or one account can read and edit
+  // another's channels by guessing a UUID.
+
+  /** Every channel belonging to a user, across all their playlists (for search). */
+  allForUser(userId: string): Channel[] {
+    return db
+      .prepare(
+        `SELECT c.* FROM channels c
+           JOIN playlists p ON p.id = c.playlist_id
+          WHERE p.user_id = ?`,
+      )
+      .all(userId)
+      .map(rowToChannel);
   },
-  byPlaylist(playlistId: string): Channel[] {
+  byPlaylist(playlistId: string, userId: string): Channel[] {
+    return db
+      .prepare(
+        `SELECT c.* FROM channels c
+           JOIN playlists p ON p.id = c.playlist_id
+          WHERE c.playlist_id = ? AND p.user_id = ?
+          ORDER BY c.sort_order`,
+      )
+      .all(playlistId, userId)
+      .map(rowToChannel);
+  },
+  /** Unscoped, for the public export routes where the token is the credential. */
+  byPlaylistForExport(playlistId: string): Channel[] {
     return db
       .prepare("SELECT * FROM channels WHERE playlist_id = ? ORDER BY sort_order")
       .all(playlistId)
       .map(rowToChannel);
   },
-  byId(id: string): Channel | null {
-    const r = db.prepare("SELECT * FROM channels WHERE id = ?").get(id);
+  byId(id: string, userId: string): Channel | null {
+    const r = db
+      .prepare(
+        `SELECT c.* FROM channels c
+           JOIN playlists p ON p.id = c.playlist_id
+          WHERE c.id = ? AND p.user_id = ?`,
+      )
+      .get(id, userId);
     return r ? rowToChannel(r as Row) : null;
   },
   maxOrder(playlistId: string): number {
@@ -510,8 +625,8 @@ export const channels = {
       );
     }
   },
-  update(id: string, patch: Partial<Channel>): Channel | null {
-    const current = this.byId(id);
+  update(id: string, userId: string, patch: Partial<Channel>): Channel | null {
+    const current = this.byId(id, userId);
     if (!current) return null;
     const next = { ...current, ...patch, updatedAt: Date.now() };
     db.prepare(
@@ -537,23 +652,39 @@ export const channels = {
       "UPDATE channels SET sort_order = ?, updated_at = ?, version = version + 1 WHERE id = ?",
     ).run(order, updatedAt, id);
   },
-  delete(id: string): void {
-    db.prepare("DELETE FROM channels WHERE id = ?").run(id);
+  delete(id: string, userId: string): boolean {
+    return (
+      (db
+        .prepare(
+          `DELETE FROM channels
+             WHERE id = ?
+               AND playlist_id IN (SELECT id FROM playlists WHERE user_id = ?)`,
+        )
+        .run(id, userId).changes as number) > 0
+    );
   },
-  deleteMany(ids: string[]): number {
+  deleteMany(ids: string[], userId: string): number {
     if (ids.length === 0) return 0;
-    const stmt = db.prepare("DELETE FROM channels WHERE id = ?");
+    const stmt = db.prepare(
+      `DELETE FROM channels
+         WHERE id = ?
+           AND playlist_id IN (SELECT id FROM playlists WHERE user_id = ?)`,
+    );
     let n = 0;
-    for (const id of ids) n += stmt.run(id).changes as number;
+    for (const id of ids) n += stmt.run(id, userId).changes as number;
     return n;
   },
   deleteByPlaylist(playlistId: string): void {
     db.prepare("DELETE FROM channels WHERE playlist_id = ?").run(playlistId);
   },
-  distinctTvgIds(): string[] {
+  distinctTvgIds(userId: string): string[] {
     return db
-      .prepare("SELECT DISTINCT tvg_id FROM channels WHERE tvg_id IS NOT NULL AND tvg_id != ''")
-      .all()
+      .prepare(
+        `SELECT DISTINCT c.tvg_id FROM channels c
+           JOIN playlists p ON p.id = c.playlist_id
+          WHERE p.user_id = ? AND c.tvg_id IS NOT NULL AND c.tvg_id != ''`,
+      )
+      .all(userId)
       .map((r: any) => r.tvg_id);
   },
 };
@@ -561,21 +692,34 @@ export const channels = {
 // ── EPG sources ─────────────────────────────────────────────────────────────
 
 export const epgSources = {
-  all(): EpgSource[] {
+  all(userId: string): EpgSource[] {
+    return db
+      .prepare("SELECT * FROM epg_sources WHERE user_id = ? ORDER BY created_at")
+      .all(userId)
+      .map(rowToEpgSource);
+  },
+  /** Unscoped — only for the boot/interval refresh loops, which run for every account. */
+  allUnscoped(): EpgSource[] {
     return db.prepare("SELECT * FROM epg_sources ORDER BY created_at").all().map(rowToEpgSource);
   },
-  byId(id: string): EpgSource | null {
+  byId(id: string, userId: string): EpgSource | null {
+    const r = db.prepare("SELECT * FROM epg_sources WHERE id = ? AND user_id = ?").get(id, userId);
+    return r ? rowToEpgSource(r as Row) : null;
+  },
+  /** Unscoped — used by the background refresh, which has no request user. */
+  byIdUnscoped(id: string): EpgSource | null {
     const r = db.prepare("SELECT * FROM epg_sources WHERE id = ?").get(id);
     return r ? rowToEpgSource(r as Row) : null;
   },
   insert(s: EpgSource): void {
     db.prepare(
       `INSERT INTO epg_sources
-         (id, name, url, type, xtream_username, xtream_password, refresh_interval_hours,
+         (id, user_id, name, url, type, xtream_username, xtream_password, refresh_interval_hours,
           last_fetched, last_fetch_error, channel_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       s.id,
+      s.userId,
       s.name,
       s.url,
       s.type,
@@ -589,8 +733,9 @@ export const epgSources = {
       s.updatedAt,
     );
   },
+  /** userId omitted deliberately: the refresh loop updates fetch status for any account. */
   update(id: string, patch: Partial<EpgSource>): EpgSource | null {
-    const current = this.byId(id);
+    const current = this.byIdUnscoped(id);
     if (!current) return null;
     const next = { ...current, ...patch, updatedAt: Date.now() };
     db.prepare(
@@ -614,32 +759,50 @@ export const epgSources = {
     );
     return next;
   },
-  delete(id: string): void {
-    db.prepare("DELETE FROM epg_sources WHERE id = ?").run(id);
+  delete(id: string, userId: string): boolean {
+    return (
+      (db.prepare("DELETE FROM epg_sources WHERE id = ? AND user_id = ?").run(id, userId)
+        .changes as number) > 0
+    );
   },
 };
 
 // ── Channel pool sources ────────────────────────────────────────────────────
 
 export const poolSources = {
-  all(): ChannelPoolSource[] {
+  all(userId: string): ChannelPoolSource[] {
+    return db
+      .prepare("SELECT * FROM channel_pool_sources WHERE user_id = ? ORDER BY created_at")
+      .all(userId)
+      .map(rowToPoolSource);
+  },
+  /** Unscoped — only for the boot/interval refresh loops. */
+  allUnscoped(): ChannelPoolSource[] {
     return db
       .prepare("SELECT * FROM channel_pool_sources ORDER BY created_at")
       .all()
       .map(rowToPoolSource);
   },
-  byId(id: string): ChannelPoolSource | null {
+  byId(id: string, userId: string): ChannelPoolSource | null {
+    const r = db
+      .prepare("SELECT * FROM channel_pool_sources WHERE id = ? AND user_id = ?")
+      .get(id, userId);
+    return r ? rowToPoolSource(r as Row) : null;
+  },
+  /** Unscoped — used by the background refresh, which has no request user. */
+  byIdUnscoped(id: string): ChannelPoolSource | null {
     const r = db.prepare("SELECT * FROM channel_pool_sources WHERE id = ?").get(id);
     return r ? rowToPoolSource(r as Row) : null;
   },
   insert(s: ChannelPoolSource): void {
     db.prepare(
       `INSERT INTO channel_pool_sources
-         (id, name, type, url, xtream_username, xtream_password, refresh_interval_hours,
+         (id, user_id, name, type, url, xtream_username, xtream_password, refresh_interval_hours,
           last_fetched, last_fetch_error, channel_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       s.id,
+      s.userId,
       s.name,
       s.type,
       s.url ?? null,
@@ -653,8 +816,9 @@ export const poolSources = {
       s.updatedAt,
     );
   },
+  /** userId omitted deliberately: the refresh loop updates fetch status for any account. */
   update(id: string, patch: Partial<ChannelPoolSource>): ChannelPoolSource | null {
-    const current = this.byId(id);
+    const current = this.byIdUnscoped(id);
     if (!current) return null;
     const next = { ...current, ...patch, updatedAt: Date.now() };
     db.prepare(
@@ -678,10 +842,13 @@ export const poolSources = {
     );
     return next;
   },
-  delete(id: string): void {
+  delete(id: string, userId: string): boolean {
     // Entries cascade via the foreign key; changelogs are cleared explicitly by
     // the caller (see the DELETE route) to match the previous behaviour.
-    db.prepare("DELETE FROM channel_pool_sources WHERE id = ?").run(id);
+    return (
+      (db.prepare("DELETE FROM channel_pool_sources WHERE id = ? AND user_id = ?").run(id, userId)
+        .changes as number) > 0
+    );
   },
 };
 
@@ -726,10 +893,16 @@ export const poolEntries = {
 // ── Channel pool changelogs ─────────────────────────────────────────────────
 
 export const poolChangeLogs = {
-  all(): ChannelPoolChangeLog[] {
+  /** Scoped through the owning source, so one account never sees another's history. */
+  all(userId: string): ChannelPoolChangeLog[] {
     return db
-      .prepare("SELECT * FROM channel_pool_change_logs ORDER BY timestamp DESC")
-      .all()
+      .prepare(
+        `SELECT l.* FROM channel_pool_change_logs l
+           JOIN channel_pool_sources s ON s.id = l.source_id
+          WHERE s.user_id = ?
+          ORDER BY l.timestamp DESC`,
+      )
+      .all(userId)
       .map(rowToChangeLog);
   },
   insert(log: ChannelPoolChangeLog): void {
@@ -985,6 +1158,7 @@ export function migrateFromJson(): { migrated: boolean; counts?: Record<string, 
         categories: p.categories ?? [],
         shortId: p.shortId || ++maxShortId,
         exportId: p.exportId || randomUUID(),
+        exportToken: p.exportToken || newExportToken(),
       });
     }
     counts.playlists = (json.playlists ?? []).length;
@@ -992,10 +1166,11 @@ export function migrateFromJson(): { migrated: boolean; counts?: Record<string, 
     channels.insertMany(json.channels ?? []);
     counts.channels = (json.channels ?? []).length;
 
-    for (const s of json.epgSources ?? []) epgSources.insert(s);
+    // Pre-existing sources predate multi-user, so they belong to the legacy account.
+    for (const s of json.epgSources ?? []) epgSources.insert({ ...s, userId: s.userId ?? LEGACY_USER_ID });
     counts.epgSources = (json.epgSources ?? []).length;
 
-    for (const s of json.channelPoolSources ?? []) poolSources.insert(s);
+    for (const s of json.channelPoolSources ?? []) poolSources.insert({ ...s, userId: s.userId ?? LEGACY_USER_ID });
     counts.channelPoolSources = (json.channelPoolSources ?? []).length;
 
     // Grouped per source so each insert satisfies the foreign key.
@@ -1006,7 +1181,7 @@ export function migrateFromJson(): { migrated: boolean; counts?: Record<string, 
     }
     let entryCount = 0;
     for (const [sourceId, list] of bySource) {
-      if (!poolSources.byId(sourceId)) {
+      if (!poolSources.byIdUnscoped(sourceId)) {
         console.warn(
           `Skipping ${list.length} pool entries for missing source ${sourceId}`,
         );
