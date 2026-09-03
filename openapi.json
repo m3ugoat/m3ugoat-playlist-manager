@@ -4,7 +4,7 @@
     "title": "m3u4me API",
     "version": "1.0.0",
     "summary": "Self-hosted, local-network IPTV playlist manager and multi-device sync API.",
-    "description": "## Authentication\n\nEvery `/api/*` route requires `Authorization: Bearer <token>` except `/api/auth/status`,\n`/api/auth/login` and `/api/auth/recover`.\n\n**If no account exists, authentication is disabled entirely** and every route is open —\nthis is the default for a fresh single-user install. Call `GET /api/auth/status` first:\n`enabled: false` means no token is needed. Create the first account with\n`POST /api/auth/set-password`.\n\nObtain a token with `POST /api/auth/login`. Tokens are per-device, survive a server\nrestart, and can be revoked individually via `DELETE /api/auth/devices/{id}`. Pass a\n`deviceName` at login so the device is identifiable in that list.\n\n`username` is optional on login while exactly one account exists, and required once a\nsecond is created.\n\n## Data isolation\n\nEvery resource belongs to one account. Requests only ever see and modify their own\naccount's data. Referencing another account's id returns **404, not 403**, so a probe\ncannot confirm that the id exists.\n\n## Optimistic concurrency\n\nMutable resources carry a `version`, returned on reads and as an `ETag` on writes.\n\n1. Read the resource and keep its `version`.\n2. Send it as `If-Match` on your next write.\n3. On **409**, the response body contains `currentVersion` and the full `current` server\n   state — merge from that and retry. No extra round trip is needed.\n\n`If-Match` is optional (RFC 9110 treats a missing precondition as no precondition), but\na syncing client SHOULD always send it. Without it, the last write wins.\n\n**The bulk routes do not support `If-Match`** — they span many rows with independent\nversions, so a single precondition would be meaningless. They are last-write-wins. Use\nthe single-resource routes where per-record safety matters.\n\n## Public export URLs\n\nIPTV players and EPG grabbers cannot send an `Authorization` header, so playlist export\nlives outside `/api` and is authorised by the playlist's unguessable `exportToken`:\n`GET /e/{token}` and `GET /e/{token}/epg`. Rotate the token to invalidate a leaked link.\n\nThe older numeric URLs (`GET /{shortId}`) are **disabled by default and return 410**,\nbecause `shortId` is a small incrementing integer and those routes are unauthenticated —\nthey would let anyone on the network enumerate every account's playlists, including\nstream URLs, which in IPTV routinely embed provider credentials.",
+    "description": "## Authentication\n\nEvery `/api/*` route requires `Authorization: Bearer <token>` except `/api/auth/status`,\n`/api/auth/login` and `/api/auth/recover`.\n\n**If no account exists, authentication is disabled entirely** and every route is open —\nthis is the default for a fresh single-user install. Call `GET /api/auth/status` first:\n`enabled: false` means no token is needed. Create the first account with\n`POST /api/auth/set-password`.\n\nObtain a token with `POST /api/auth/login`. Tokens are per-device, survive a server\nrestart, and can be revoked individually via `DELETE /api/auth/devices/{id}`. Pass a\n`deviceName` at login so the device is identifiable in that list.\n\n`username` is optional on login while exactly one account exists, and required once a\nsecond is created.\n\n## Data isolation\n\nEvery resource belongs to one account. Requests only ever see and modify their own\naccount's data. Referencing another account's id returns **404, not 403**, so a probe\ncannot confirm that the id exists.\n\n## Optimistic concurrency\n\nMutable resources carry a `version`, returned on reads and as an `ETag` on writes.\n\n1. Read the resource and keep its `version`.\n2. Send it as `If-Match` on your next write.\n3. On **409**, the response body contains `currentVersion` and the full `current` server\n   state — merge from that and retry. No extra round trip is needed.\n\n`If-Match` is optional (RFC 9110 treats a missing precondition as no precondition), but\na syncing client SHOULD always send it. Without it, the last write wins.\n\n**The bulk routes take no `If-Match`** — a single precondition cannot express one over\nmany rows with independent versions. They accept a `versions` map instead (or a\nper-entry `version` on `bulk-update-many`). Items whose version has moved on are\n**skipped and returned in `conflicts`**, while the rest still apply — failing a whole\nbatch because one row changed would be hostile, and a sync client needs to know which\nitems to re-merge. Omit `versions` for last-write-wins.\n\n## Public export URLs\n\nIPTV players and EPG grabbers cannot send an `Authorization` header, so playlist export\nlives outside `/api` and is authorised by the playlist's unguessable `exportToken`:\n`GET /e/{token}` and `GET /e/{token}/epg`. Rotate the token to invalidate a leaked link.\n\nThe older numeric URLs (`GET /{shortId}`) are **disabled by default and return 410**,\nbecause `shortId` is a small incrementing integer and those routes are unauthenticated —\nthey would let anyone on the network enumerate every account's playlists, including\nstream URLs, which in IPTV routinely embed provider credentials.",
     "license": {
       "name": "GPL-3.0",
       "identifier": "GPL-3.0-only"
@@ -1288,7 +1288,7 @@
           "Playlists"
         ],
         "summary": "Apply the same changes to many channels",
-        "description": "**No `If-Match`** — last write wins.",
+        "description": "Takes no `If-Match` — a single precondition is meaningless across many rows. Pass `versions` for per-item preconditions instead.",
         "parameters": [
           {
             "name": "playlistId",
@@ -1319,6 +1319,14 @@
                   },
                   "updates": {
                     "$ref": "#/components/schemas/ChannelInput"
+                  },
+                  "versions": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "description": "Optional map of channel id to the `version` you last read. Items whose version has moved on are skipped and listed in `conflicts`; the rest still apply. Omit for last-write-wins."
                   }
                 }
               }
@@ -1327,11 +1335,21 @@
         },
         "responses": {
           "200": {
-            "description": "Applied.",
+            "description": "Applied. `conflicts` lists items skipped because their version had moved.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Success"
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed `versions`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1352,7 +1370,7 @@
           "Playlists"
         ],
         "summary": "Apply per-channel changes",
-        "description": "**No `If-Match`** — last write wins.",
+        "description": "Each entry may carry its own `version` — the natural place for it, since the payload is already per-channel. Entries whose version has moved on are skipped and listed in `conflicts`.",
         "parameters": [
           {
             "name": "playlistId",
@@ -1388,6 +1406,11 @@
                         },
                         "changes": {
                           "$ref": "#/components/schemas/ChannelInput"
+                        },
+                        "version": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "description": "Optional precondition for this entry."
                         }
                       }
                     }
@@ -1399,11 +1422,11 @@
         },
         "responses": {
           "200": {
-            "description": "Applied.",
+            "description": "Applied. `conflicts` lists skipped entries.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Success"
+                  "$ref": "#/components/schemas/BulkResult"
                 }
               }
             }
@@ -1424,7 +1447,7 @@
           "Playlists"
         ],
         "summary": "Find and replace across one field",
-        "description": "**No `If-Match`** — last write wins.",
+        "description": "Takes no `If-Match`. Pass `versions` for per-item preconditions.",
         "parameters": [
           {
             "name": "playlistId",
@@ -1464,6 +1487,14 @@
                       "type": "string"
                     },
                     "description": "Restrict to these channels. Omit for the whole playlist."
+                  },
+                  "versions": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "description": "Optional map of channel id to the `version` you last read. Items whose version has moved on are skipped and listed in `conflicts`; the rest still apply. Omit for last-write-wins."
                   }
                 }
               }
@@ -1472,7 +1503,7 @@
         },
         "responses": {
           "200": {
-            "description": "Applied.",
+            "description": "Applied. `conflicts` lists skipped items.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1483,6 +1514,12 @@
                     },
                     "modified": {
                       "type": "integer"
+                    },
+                    "conflicts": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/BulkConflict"
+                      }
                     }
                   }
                 }
@@ -1508,7 +1545,7 @@
           "Playlists"
         ],
         "summary": "Delete many channels",
-        "description": "**No `If-Match`** — last write wins.",
+        "description": "Takes no `If-Match`. Pass `versions` for per-item preconditions.",
         "parameters": [
           {
             "name": "playlistId",
@@ -1535,6 +1572,14 @@
                     "items": {
                       "type": "string"
                     }
+                  },
+                  "versions": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "description": "Optional map of channel id to the `version` you last read. Items whose version has moved on are skipped and listed in `conflicts`; the rest still apply. Omit for last-write-wins."
                   }
                 }
               }
@@ -1543,11 +1588,21 @@
         },
         "responses": {
           "200": {
-            "description": "Deleted.",
+            "description": "Deleted. `conflicts` lists items skipped because their version had moved.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Success"
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed `versions`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1568,7 +1623,7 @@
           "Playlists"
         ],
         "summary": "Set channel order",
-        "description": "Applied in one transaction, so a reorder cannot half-apply. **No `If-Match`**.",
+        "description": "Applied in one transaction, so a reorder cannot half-apply. Takes no `If-Match`; pass `versions` for per-item preconditions.",
         "parameters": [
           {
             "name": "playlistId",
@@ -1596,6 +1651,14 @@
                       "type": "integer"
                     },
                     "description": "Map of channel id to new `order`."
+                  },
+                  "versions": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "description": "Optional map of channel id to the `version` you last read. Items whose version has moved on are skipped and listed in `conflicts`; the rest still apply. Omit for last-write-wins."
                   }
                 }
               }
@@ -1604,11 +1667,21 @@
         },
         "responses": {
           "200": {
-            "description": "Reordered.",
+            "description": "Reordered. `conflicts` lists skipped channels.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Success"
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed `versions`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -3103,6 +3176,53 @@
           "success": {
             "type": "boolean",
             "const": true
+          }
+        }
+      },
+      "BulkConflict": {
+        "type": "object",
+        "required": [
+          "id",
+          "expected",
+          "current"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "expected": {
+            "type": "integer",
+            "description": "The version you sent."
+          },
+          "current": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The version now stored, or null if the row is gone."
+          }
+        }
+      },
+      "BulkResult": {
+        "type": "object",
+        "description": "Result of a bulk write. Non-conflicting items are applied even when others are skipped, so check `conflicts` and re-merge just those.",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "applied": {
+            "type": "integer",
+            "description": "Items written."
+          },
+          "deleted": {
+            "type": "integer",
+            "description": "Items removed (delete routes only)."
+          },
+          "conflicts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkConflict"
+            }
           }
         }
       },

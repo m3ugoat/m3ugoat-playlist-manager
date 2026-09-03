@@ -70,6 +70,28 @@ const ifMatchParam = {
     "The `version` this client last read. Omit for last-write-wins. Accepts `3`, `\"3\"` or `W/\"3\"`; `*` means no precondition. A stale value returns 409, a malformed one 400.",
 } as const;
 
+/**
+ * Optional per-item preconditions for the bulk routes. A single If-Match cannot
+ * express a precondition over many rows with independent versions, so these
+ * take a map instead and skip-and-report rather than refusing the batch.
+ */
+const versionsProp = {
+  type: "object",
+  additionalProperties: { type: "integer", minimum: 1 },
+  description:
+    "Optional map of channel id to the `version` you last read. Items whose version has moved on are skipped and listed in `conflicts`; the rest still apply. Omit for last-write-wins.",
+} as const;
+
+const bulkConflictSchema = {
+  type: "object",
+  required: ["id", "expected", "current"],
+  properties: {
+    id: { type: "string" },
+    expected: { type: "integer", description: "The version you sent." },
+    current: { type: ["integer", "null"], description: "The version now stored, or null if the row is gone." },
+  },
+} as const;
+
 // Routes that mutate a single resource share this set of failure modes.
 const conditionalErrors = {
   "400": errRef("BadIfMatch"),
@@ -218,9 +240,12 @@ const document = {
       "`If-Match` is optional (RFC 9110 treats a missing precondition as no precondition), but",
       "a syncing client SHOULD always send it. Without it, the last write wins.",
       "",
-      "**The bulk routes do not support `If-Match`** — they span many rows with independent",
-      "versions, so a single precondition would be meaningless. They are last-write-wins. Use",
-      "the single-resource routes where per-record safety matters.",
+      "**The bulk routes take no `If-Match`** — a single precondition cannot express one over",
+      "many rows with independent versions. They accept a `versions` map instead (or a",
+      "per-entry `version` on `bulk-update-many`). Items whose version has moved on are",
+      "**skipped and returned in `conflicts`**, while the rest still apply — failing a whole",
+      "batch because one row changed would be hostile, and a sync client needs to know which",
+      "items to re-merge. Omit `versions` for last-write-wins.",
       "",
       "## Public export URLs",
       "",
@@ -640,14 +665,24 @@ const document = {
       post: {
         tags: ["Playlists"],
         summary: "Apply the same changes to many channels",
-        description: "**No `If-Match`** — last write wins.",
+        description:
+          "Takes no `If-Match` — a single precondition is meaningless across many rows. Pass `versions` for per-item preconditions instead.",
         parameters: [pathParam("playlistId", "Playlist id.")],
         requestBody: jsonBody({
           type: "object",
           required: ["ids", "updates"],
-          properties: { ids: { type: "array", items: { type: "string" } }, updates: ref("ChannelInput") },
+          properties: {
+            ids: { type: "array", items: { type: "string" } },
+            updates: ref("ChannelInput"),
+            versions: versionsProp,
+          },
         }),
-        responses: { "200": jsonResponse("Applied.", ref("Success")), "401": errRef("Unauthorized"), "404": errRef("NotFound") },
+        responses: {
+          "200": jsonResponse("Applied. `conflicts` lists items skipped because their version had moved.", ref("BulkResult")),
+          "400": jsonResponse("Malformed `versions`.", ref("Error")),
+          "401": errRef("Unauthorized"),
+          "404": errRef("NotFound"),
+        },
       },
     },
 
@@ -655,7 +690,8 @@ const document = {
       post: {
         tags: ["Playlists"],
         summary: "Apply per-channel changes",
-        description: "**No `If-Match`** — last write wins.",
+        description:
+          "Each entry may carry its own `version` — the natural place for it, since the payload is already per-channel. Entries whose version has moved on are skipped and listed in `conflicts`.",
         parameters: [pathParam("playlistId", "Playlist id.")],
         requestBody: jsonBody({
           type: "object",
@@ -666,12 +702,20 @@ const document = {
               items: {
                 type: "object",
                 required: ["id", "changes"],
-                properties: { id: { type: "string" }, changes: ref("ChannelInput") },
+                properties: {
+                  id: { type: "string" },
+                  changes: ref("ChannelInput"),
+                  version: { type: "integer", minimum: 1, description: "Optional precondition for this entry." },
+                },
               },
             },
           },
         }),
-        responses: { "200": jsonResponse("Applied.", ref("Success")), "401": errRef("Unauthorized"), "404": errRef("NotFound") },
+        responses: {
+          "200": jsonResponse("Applied. `conflicts` lists skipped entries.", ref("BulkResult")),
+          "401": errRef("Unauthorized"),
+          "404": errRef("NotFound"),
+        },
       },
     },
 
@@ -679,7 +723,7 @@ const document = {
       post: {
         tags: ["Playlists"],
         summary: "Find and replace across one field",
-        description: "**No `If-Match`** — last write wins.",
+        description: "Takes no `If-Match`. Pass `versions` for per-item preconditions.",
         parameters: [pathParam("playlistId", "Playlist id.")],
         requestBody: jsonBody({
           type: "object",
@@ -689,12 +733,17 @@ const document = {
             replace: { type: "string", default: "" },
             field: { type: "string", default: "url", description: "Which channel field to rewrite." },
             ids: { type: "array", items: { type: "string" }, description: "Restrict to these channels. Omit for the whole playlist." },
+            versions: versionsProp,
           },
         }),
         responses: {
-          "200": jsonResponse("Applied.", {
+          "200": jsonResponse("Applied. `conflicts` lists skipped items.", {
             type: "object",
-            properties: { success: { type: "boolean" }, modified: { type: "integer" } },
+            properties: {
+              success: { type: "boolean" },
+              modified: { type: "integer" },
+              conflicts: { type: "array", items: ref("BulkConflict") },
+            },
           }),
           "400": errRef("BadRequest"),
           "401": errRef("Unauthorized"),
@@ -707,10 +756,19 @@ const document = {
       post: {
         tags: ["Playlists"],
         summary: "Delete many channels",
-        description: "**No `If-Match`** — last write wins.",
+        description: "Takes no `If-Match`. Pass `versions` for per-item preconditions.",
         parameters: [pathParam("playlistId", "Playlist id.")],
-        requestBody: jsonBody({ type: "object", required: ["ids"], properties: { ids: { type: "array", items: { type: "string" } } } }),
-        responses: { "200": jsonResponse("Deleted.", ref("Success")), "401": errRef("Unauthorized"), "404": errRef("NotFound") },
+        requestBody: jsonBody({
+          type: "object",
+          required: ["ids"],
+          properties: { ids: { type: "array", items: { type: "string" } }, versions: versionsProp },
+        }),
+        responses: {
+          "200": jsonResponse("Deleted. `conflicts` lists items skipped because their version had moved.", ref("BulkResult")),
+          "400": jsonResponse("Malformed `versions`.", ref("Error")),
+          "401": errRef("Unauthorized"),
+          "404": errRef("NotFound"),
+        },
       },
     },
 
@@ -718,16 +776,23 @@ const document = {
       post: {
         tags: ["Playlists"],
         summary: "Set channel order",
-        description: "Applied in one transaction, so a reorder cannot half-apply. **No `If-Match`**.",
+        description:
+          "Applied in one transaction, so a reorder cannot half-apply. Takes no `If-Match`; pass `versions` for per-item preconditions.",
         parameters: [pathParam("playlistId", "Playlist id.")],
         requestBody: jsonBody({
           type: "object",
           required: ["orders"],
           properties: {
             orders: { type: "object", additionalProperties: { type: "integer" }, description: "Map of channel id to new `order`." },
+            versions: versionsProp,
           },
         }),
-        responses: { "200": jsonResponse("Reordered.", ref("Success")), "401": errRef("Unauthorized"), "404": errRef("NotFound") },
+        responses: {
+          "200": jsonResponse("Reordered. `conflicts` lists skipped channels.", ref("BulkResult")),
+          "400": jsonResponse("Malformed `versions`.", ref("Error")),
+          "401": errRef("Unauthorized"),
+          "404": errRef("NotFound"),
+        },
       },
     },
 
@@ -1167,6 +1232,20 @@ const document = {
       },
 
       Success: { type: "object", properties: { success: { type: "boolean", const: true } } },
+
+      BulkConflict: bulkConflictSchema,
+
+      BulkResult: {
+        type: "object",
+        description:
+          "Result of a bulk write. Non-conflicting items are applied even when others are skipped, so check `conflicts` and re-merge just those.",
+        properties: {
+          success: { type: "boolean" },
+          applied: { type: "integer", description: "Items written." },
+          deleted: { type: "integer", description: "Items removed (delete routes only)." },
+          conflicts: { type: "array", items: ref("BulkConflict") },
+        },
+      },
 
       UserSummary: {
         type: "object",

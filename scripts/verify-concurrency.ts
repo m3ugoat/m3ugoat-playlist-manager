@@ -162,6 +162,89 @@ try {
   r = await call("GET", "/api/channel-pool/sources");
   check("pool source survived the rejected delete", r.body.length === 1 && r.body[0].name === "Pool v2");
 
+  // ── Bulk routes: per-item versions, skip-and-report ──
+  //
+  // The behaviour that matters is partial application: one stale item must not
+  // stop the others from landing, and the client must be told which failed.
+  await call("POST", `/api/playlists/${pid}/channels/bulk`, {
+    channels: [
+      { name: "B1", url: "http://b.test/1", category: "Bulk" },
+      { name: "B2", url: "http://b.test/2", category: "Bulk" },
+      { name: "B3", url: "http://b.test/3", category: "Bulk" },
+    ],
+  });
+  r = await call("GET", `/api/playlists/${pid}/channels`);
+  const bulk = r.body.filter((c: any) => c.category === "Bulk");
+  check("three channels created for the bulk checks", bulk.length === 3, `${bulk.length}`);
+
+  // Move B2 out from under us so its version is stale.
+  await call("PUT", `/api/playlists/${pid}/channels/${bulk[1].id}`, { name: "B2 moved" });
+
+  r = await call("POST", `/api/playlists/${pid}/channels/bulk-update`, {
+    ids: bulk.map((c: any) => c.id),
+    updates: { category: "Bulk" , isHidden: true },
+    versions: Object.fromEntries(bulk.map((c: any) => [c.id, c.version])),
+  });
+  check("bulk-update applies the non-stale items", r.body?.applied === 2, `applied ${r.body?.applied}`);
+  check("bulk-update reports exactly the stale item", r.body?.conflicts?.length === 1 && r.body.conflicts[0].id === bulk[1].id, JSON.stringify(r.body?.conflicts));
+  check("the conflict carries expected and current versions",
+    r.body?.conflicts?.[0]?.expected === bulk[1].version && r.body.conflicts[0].current === bulk[1].version + 1,
+    JSON.stringify(r.body?.conflicts?.[0]));
+
+  r = await call("GET", `/api/playlists/${pid}/channels`);
+  const after = r.body.filter((c: any) => c.category === "Bulk");
+  check("the two applied items really changed", after.filter((c: any) => c.isHidden).length === 2);
+  check("the skipped item kept its value", after.find((c: any) => c.id === bulk[1].id)?.name === "B2 moved");
+
+  // Omitting `versions` must stay last-write-wins, which is what the web UI does.
+  r = await call("POST", `/api/playlists/${pid}/channels/bulk-update`, {
+    ids: bulk.map((c: any) => c.id),
+    updates: { isHidden: false },
+  });
+  check("bulk-update with no versions applies everything", r.body?.applied === 3 && r.body?.conflicts?.length === 0, `applied ${r.body?.applied}`);
+
+  r = await call("POST", `/api/playlists/${pid}/channels/bulk-update`, {
+    ids: [bulk[0].id],
+    updates: { isHidden: true },
+    versions: { [bulk[0].id]: "not-a-number" },
+  });
+  check("a malformed versions map is 400", r.status === 400, `got ${r.status}`);
+
+  // bulk-update-many carries the version per entry.
+  r = await call("GET", `/api/playlists/${pid}/channels`);
+  const cur = r.body.filter((c: any) => c.category === "Bulk");
+  r = await call("POST", `/api/playlists/${pid}/channels/bulk-update-many`, {
+    updates: [
+      { id: cur[0].id, changes: { name: "M1" }, version: cur[0].version },
+      { id: cur[1].id, changes: { name: "M2" }, version: 1 }, // stale on purpose
+    ],
+  });
+  check("bulk-update-many honours per-entry versions", r.body?.applied === 1 && r.body?.conflicts?.length === 1, `applied ${r.body?.applied}, conflicts ${r.body?.conflicts?.length}`);
+
+  // reorder
+  r = await call("GET", `/api/playlists/${pid}/channels`);
+  const ro = r.body.filter((c: any) => c.category === "Bulk");
+  r = await call("POST", `/api/playlists/${pid}/channels/reorder`, {
+    orders: { [ro[0].id]: 50, [ro[1].id]: 51 },
+    versions: { [ro[0].id]: ro[0].version, [ro[1].id]: 1 },
+  });
+  check("reorder honours per-item versions", r.body?.applied === 1 && r.body?.conflicts?.length === 1, `applied ${r.body?.applied}`);
+  r = await call("GET", `/api/playlists/${pid}/channels`);
+  check("the reordered item moved and the stale one did not",
+    r.body.find((c: any) => c.id === ro[0].id)?.order === 50 && r.body.find((c: any) => c.id === ro[1].id)?.order !== 51);
+
+  // bulk-delete
+  r = await call("GET", `/api/playlists/${pid}/channels`);
+  const del = r.body.filter((c: any) => c.category === "Bulk");
+  r = await call("POST", `/api/playlists/${pid}/channels/bulk-delete`, {
+    ids: del.map((c: any) => c.id),
+    versions: Object.fromEntries(del.map((c: any, i: number) => [c.id, i === 0 ? c.version : 1])),
+  });
+  check("bulk-delete deletes only the version-matching items", r.body?.deleted === 1, `deleted ${r.body?.deleted}`);
+  check("bulk-delete reports the rest as conflicts", r.body?.conflicts?.length === del.length - 1, `${r.body?.conflicts?.length}`);
+  r = await call("GET", `/api/playlists/${pid}/channels`);
+  check("the conflicting channels survived the delete", r.body.filter((c: any) => c.category === "Bulk").length === del.length - 1);
+
   // ── A burst of concurrent conditional writes on one version: exactly one wins ──
   r = await call("GET", "/api/playlists");
   const base = r.body.find((p: any) => p.id === pid).version;

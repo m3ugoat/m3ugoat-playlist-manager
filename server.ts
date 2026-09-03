@@ -520,6 +520,44 @@ function sendWriteResult<T extends { version: number }>(
   });
 }
 
+/**
+ * Per-item preconditions for the bulk routes.
+ *
+ * A single If-Match is meaningless across many rows with independent versions,
+ * so these routes instead accept an optional `versions` map of channel id to the
+ * version the client last read. Items whose version has moved on are **skipped
+ * and reported**, rather than failing the whole batch — failing 500 good edits
+ * because one row changed would be hostile, and a sync client needs to know
+ * which ones to re-merge, not that everything was refused.
+ *
+ * Omitting `versions` keeps the previous last-write-wins behaviour, which is
+ * what the web UI relies on.
+ */
+interface BulkConflict {
+  id: string;
+  expected: number;
+  current: number | null;
+}
+
+function parseVersionsMap(body: any): Record<string, number> | null {
+  const raw = body?.versions;
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out: Record<string, number> = {};
+  for (const [id, v] of Object.entries(raw)) {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 1) return null;
+    out[id] = n;
+  }
+  return out;
+}
+
+/** Records a skipped item, reading back the current version for the client. */
+function noteConflict(conflicts: BulkConflict[], id: string, expected: number, userId: string) {
+  const current = store.channels.byId(id, userId);
+  conflicts.push({ id, expected, current: current ? current.version : null });
+}
+
 /** Rejects a malformed If-Match with 400. Returns the parsed version, or false if handled. */
 function ifMatchOr400(req: express.Request, res: express.Response): number | undefined | false {
   const expected = parseIfMatch(req);
@@ -1610,11 +1648,26 @@ async function startServer() {
     if (!store.playlists.byId(playlistId, userId)) {
       return res.status(404).json({ error: "Not found" });
     }
+    const versions = parseVersionsMap(req.body);
+    if (req.body?.versions !== undefined && versions === null) {
+      return res.status(400).json({ error: 'Malformed `versions`: expected a map of id to version number' });
+    }
+    const conflicts: BulkConflict[] = [];
+    let applied = 0;
 
     store.inTransaction(() => {
       const idSet = new Set<string>(ids ?? []);
       for (const c of store.channels.byPlaylist(playlistId, userId)) {
-        if (idSet.has(c.id)) store.channels.updateUnconditional(c.id, userId, updates);
+        if (!idSet.has(c.id)) continue;
+        const expected = versions?.[c.id];
+        if (expected !== undefined) {
+          const r = store.channels.update(c.id, userId, updates, expected);
+          if (r.status === 'ok') applied++;
+          else noteConflict(conflicts, c.id, expected, userId);
+        } else {
+          store.channels.updateUnconditional(c.id, userId, updates);
+          applied++;
+        }
       }
 
       // Handle new category dynamic pushing
@@ -1628,7 +1681,7 @@ async function startServer() {
       }
     });
 
-    res.json({ success: true });
+    res.json({ success: true, applied, conflicts });
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk-update-many", (req, res) => {
@@ -1639,7 +1692,14 @@ async function startServer() {
     if (!store.playlists.byId(playlistId, userId)) {
       return res.status(404).json({ error: "Not found" });
     }
+    // Each entry may carry its own `version`, which is the natural place for it
+    // here since the payload is already per-channel.
     const updateMap = new Map<string, any>(updates.map((u: any) => [u.id, u.changes]));
+    const versionMap = new Map<string, number>(
+      updates.filter((u: any) => Number.isInteger(u?.version)).map((u: any) => [u.id, u.version]),
+    );
+    const conflicts: BulkConflict[] = [];
+    let applied = 0;
 
     store.inTransaction(() => {
       const playlist = store.playlists.byId(playlistId, userId);
@@ -1648,12 +1708,24 @@ async function startServer() {
       for (const c of store.channels.byPlaylist(playlistId, userId)) {
         if (!updateMap.has(c.id)) continue;
         const changes = updateMap.get(c.id);
+        const expected = versionMap.get(c.id);
+
+        if (expected !== undefined) {
+          const r = store.channels.update(c.id, userId, changes, expected);
+          if (r.status !== 'ok') {
+            noteConflict(conflicts, c.id, expected, userId);
+            continue; // don't add a category for an edit that didn't land
+          }
+          applied++;
+        } else {
+          store.channels.updateUnconditional(c.id, userId, changes);
+          applied++;
+        }
 
         // Handle new category dynamic pushing
         if (changes.category && !categories.includes(changes.category)) {
           categories.push(changes.category);
         }
-        store.channels.updateUnconditional(c.id, userId, changes);
       }
 
       if (playlist && categories.length !== playlist.categories.length) {
@@ -1661,7 +1733,7 @@ async function startServer() {
       }
     });
 
-    res.json({ success: true });
+    res.json({ success: true, applied, conflicts });
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk-replace", (req, res) => {
@@ -1674,7 +1746,12 @@ async function startServer() {
     if (!store.playlists.byId(playlistId, userId)) {
       return res.status(404).json({ error: "Not found" });
     }
+    const versions = parseVersionsMap(req.body);
+    if (req.body?.versions !== undefined && versions === null) {
+      return res.status(400).json({ error: 'Malformed `versions`: expected a map of id to version number' });
+    }
     const targetField = field || "url";
+    const conflicts: BulkConflict[] = [];
     let modified = 0;
 
     store.inTransaction(() => {
@@ -1684,12 +1761,18 @@ async function startServer() {
         if (typeof current !== "string" || !current.includes(search)) continue;
         const updated = current.replaceAll(search, replace ?? "");
         if (updated === current) continue;
+        const expected = versions?.[c.id];
+        if (expected !== undefined) {
+          const r = store.channels.update(c.id, userId, { [targetField]: updated } as Partial<Channel>, expected);
+          if (r.status !== 'ok') { noteConflict(conflicts, c.id, expected, userId); continue; }
+        } else {
+          store.channels.updateUnconditional(c.id, userId, { [targetField]: updated } as Partial<Channel>);
+        }
         modified++;
-        store.channels.updateUnconditional(c.id, userId, { [targetField]: updated } as Partial<Channel>);
       }
     });
 
-    res.json({ success: true, modified });
+    res.json({ success: true, modified, conflicts });
   });
 
   app.post("/api/playlists/:playlistId/channels/bulk-delete", (req, res) => {
@@ -1699,14 +1782,32 @@ async function startServer() {
     if (!store.playlists.byId(playlistId, userId)) {
       return res.status(404).json({ error: "Not found" });
     }
+    const versions = parseVersionsMap(req.body);
+    if (req.body?.versions !== undefined && versions === null) {
+      return res.status(400).json({ error: 'Malformed `versions`: expected a map of id to version number' });
+    }
     // Scoped to the playlist, matching the previous filter.
     const idSet = new Set<string>(ids ?? []);
-    const toDelete = store.channels
-      .byPlaylist(playlistId, userId)
-      .filter(c => idSet.has(c.id))
-      .map(c => c.id);
-    store.inTransaction(() => store.channels.deleteMany(toDelete, userId));
-    res.json({ success: true });
+    const targets = store.channels.byPlaylist(playlistId, userId).filter(c => idSet.has(c.id));
+    const conflicts: BulkConflict[] = [];
+    let deleted = 0;
+
+    store.inTransaction(() => {
+      if (!versions) {
+        deleted = store.channels.deleteMany(targets.map(c => c.id), userId);
+        return;
+      }
+      for (const c of targets) {
+        const expected = versions[c.id];
+        if (expected === undefined) {
+          if (store.channels.delete(c.id, userId).status === 'ok') deleted++;
+          continue;
+        }
+        if (store.channels.delete(c.id, userId, expected).status === 'ok') deleted++;
+        else noteConflict(conflicts, c.id, expected, userId);
+      }
+    });
+    res.json({ success: true, deleted, conflicts });
   });
 
   app.post("/api/playlists/:playlistId/channels/reorder", (req, res) => {
@@ -1716,14 +1817,29 @@ async function startServer() {
     if (!store.playlists.byId(playlistId, userId)) {
       return res.status(404).json({ error: "Not found" });
     }
+    const versions = parseVersionsMap(req.body);
+    if (req.body?.versions !== undefined && versions === null) {
+      return res.status(400).json({ error: 'Malformed `versions`: expected a map of id to version number' });
+    }
+    const conflicts: BulkConflict[] = [];
+    let applied = 0;
+
     // One transaction for the whole reorder, so a drag can't half-apply.
     store.inTransaction(() => {
       const now = Date.now();
       for (const c of store.channels.byPlaylist(playlistId, userId)) {
-        if (orders[c.id] !== undefined) store.channels.setOrder(c.id, orders[c.id], now);
+        if (orders[c.id] === undefined) continue;
+        const expected = versions?.[c.id];
+        if (expected !== undefined) {
+          if (store.channels.setOrderIfVersion(c.id, orders[c.id], expected, now)) applied++;
+          else noteConflict(conflicts, c.id, expected, userId);
+        } else {
+          store.channels.setOrder(c.id, orders[c.id], now);
+          applied++;
+        }
       }
     });
-    res.json({ success: true });
+    res.json({ success: true, applied, conflicts });
   });
 
   app.post("/api/health-check", async (req, res) => {

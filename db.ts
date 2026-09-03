@@ -753,6 +753,20 @@ export const channels = {
       "UPDATE channels SET sort_order = ?, updated_at = ?, version = version + 1 WHERE id = ?",
     ).run(order, updatedAt, id);
   },
+  /**
+   * Version-checked setOrder for the reorder route. Returns false when the row
+   * has moved on, so the caller can report it as a conflict and leave it alone.
+   * Cheaper than update(), which rewrites every column.
+   */
+  setOrderIfVersion(id: string, order: number, expectedVersion: number, updatedAt = Date.now()): boolean {
+    return (
+      (db
+        .prepare(
+          "UPDATE channels SET sort_order = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?",
+        )
+        .run(order, updatedAt, id, expectedVersion).changes as number) > 0
+    );
+  },
   delete(id: string, userId: string, expectedVersion?: number): WriteResult<Channel> {
     const current = this.byId(id, userId);
     if (!current) return { status: "notfound" };
