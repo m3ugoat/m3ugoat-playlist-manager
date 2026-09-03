@@ -45,7 +45,7 @@ async function extractErrorMessage(res: Response): Promise<string> {
  * /api/auth/ endpoints are exempted since their callers inspect `ok`/`status` themselves to
  * show inline form errors (wrong password, etc.) rather than a generic failure.
  */
-async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
+export async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const headers = { ...authHeaders(), ...(options.headers as Record<string, string> || {}) };
   const res = await fetch(url, { ...options, headers });
   if (res.status === 401 && !url.includes('/api/auth/')) {

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { authFetch } from '../apiClient';
 
 const GITHUB_API_LATEST = 'https://api.github.com/repos/andrei-savin/m3u4me/releases/latest';
 
@@ -13,8 +14,13 @@ interface VersionInfo {
   updateCheckFailed: boolean;
 }
 
-/** Compares two semver strings. Returns 1 if b > a, -1 if a > b, 0 if equal. */
-function compareSemver(a: string, b: string): number {
+/**
+ * Compares two semver strings. Returns 1 if b > a, -1 if a > b, 0 if equal.
+ * Tolerates missing/blank input rather than throwing — it is fed a version from
+ * the API and a tag name from GitHub, either of which can be absent.
+ */
+function compareSemver(a: string | null | undefined, b: string | null | undefined): number {
+  if (!a || !b) return 0;
   const pa = a.replace(/^v/, '').split('.').map(Number);
   const pb = b.replace(/^v/, '').split('.').map(Number);
   for (let i = 0; i < 3; i++) {
@@ -40,9 +46,14 @@ export function useVersionInfo(): VersionInfo {
     let cancelled = false;
     (async () => {
       try {
-        // Fetch local version
-        const localRes = await fetch('/api/version');
+        // /api/version is behind the auth middleware, so this has to go through
+        // authFetch. With a plain fetch it returns 401 + {"error":...}, which
+        // parses fine as JSON and leaves `current` undefined — and then
+        // compareSemver(undefined, latest) throws. Only reproducible once a
+        // password is set, which is why it stayed hidden.
+        const localRes = await authFetch('/api/version');
         const { version: current } = await localRes.json();
+        if (!current) throw new Error('No version in /api/version response');
 
         // Fetch latest GitHub release
         let latest: string | null = null;
