@@ -3,6 +3,7 @@ import { useStore } from '../store';
 import { api, clearSessionToken } from '../apiClient';
 import { ArrowLeft, Shield, Palette, Eye, EyeOff, Copy, Check, KeyRound, Lock, Unlock, Github, ArrowUpCircle, Info, Coffee } from 'lucide-react';
 import { Logo } from './Logo';
+import AccountSettings from './AccountSettings';
 import { useVersionInfo } from './AppInfo';
 import { contrastText } from '../store';
 
@@ -453,6 +454,9 @@ export default function SettingsPage() {
               )}
             </div>
           </section>
+
+          {/* Devices + accounts. Renders nothing when auth is disabled. */}
+          <AccountSettings />
 
           {/* ── About ─────────────────────────────────────────────────────── */}
           <section className="bg-white dark:bg-[#1e1e1e] amoled:dark:bg-[#0a0a0a] rounded-lg elev-1 overflow-hidden">

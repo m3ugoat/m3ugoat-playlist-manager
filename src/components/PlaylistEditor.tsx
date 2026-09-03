@@ -5,7 +5,7 @@ import { useStore, contrastText, accentAlpha, notifyError } from '../store';
 import {
   Download, Check, Copy,
   GripVertical, CheckSquare, Square, Trash2, Eye, EyeOff, Plus, ArrowUp, ArrowDown, Activity, X,
-  Replace, Search, Wand2, ChevronLeft, ChevronRight, Layers,
+  Replace, Search, Wand2, ChevronLeft, ChevronRight, Layers, RefreshCw, ShieldAlert,
 } from 'lucide-react';
 import BulkEpgAssignDialog from './BulkEpgAssignDialog';
 import ChannelLogo from './ChannelLogo';
@@ -386,6 +386,7 @@ export default function PlaylistEditor({ playlistId }: { playlistId: string }) {
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copiedEpg, setCopiedEpg] = useState(false);
+  const [rotating, setRotating] = useState(false);
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
@@ -591,8 +592,12 @@ export default function PlaylistEditor({ playlistId }: { playlistId: string }) {
 
   if (!playlist) return null;
 
-  const exportUrl = `${window.location.protocol}//${window.location.host}/${playlist.shortId}`;
-  const epgUrl = `${window.location.protocol}//${window.location.host}/${playlist.shortId}/epg`;
+  // Export links use the playlist's unguessable export token, not its shortId.
+  // The old /<shortId> URLs are disabled server-side (410) because they are
+  // enumerable and unauthenticated; see the export section in CLAUDE.md.
+  const exportBase = `${window.location.protocol}//${window.location.host}/e/${playlist.exportToken}`;
+  const exportUrl = exportBase;
+  const epgUrl = `${exportBase}/epg`;
 
   /* ── Handlers ──────────────────────────────────────────────────────────── */
 
@@ -614,6 +619,25 @@ export default function PlaylistEditor({ playlistId }: { playlistId: string }) {
 
   const copyToClipboard = () => copyText(exportUrl, setCopied);
   const copyEpgToClipboard = () => copyText(epgUrl, setCopiedEpg);
+
+  // Anyone holding an export link can read this playlist without logging in, so
+  // rotating is the way to cut off a link that has been shared too widely.
+  const rotateExportLink = async () => {
+    if (!window.confirm(
+      'Generate a new export link?\n\nThe current M3U and EPG links will stop working immediately, ' +
+      'and every player or EPG grabber using them will need to be updated.',
+    )) return;
+    setRotating(true);
+    try {
+      await api.rotateExportToken(playlist.id);
+      triggerRefresh();
+    } catch (e) {
+      console.error(e);
+      notifyError(e, 'Failed to generate a new export link.');
+    } finally {
+      setRotating(false);
+    }
+  };
 
   const toggleSelection = (id: string, shiftKey: boolean) => {
     const next = new Set(selectedIds);
@@ -1265,6 +1289,28 @@ export default function PlaylistEditor({ playlistId }: { playlistId: string }) {
                   </a>
                 </div>
               </div>
+
+              {/* These links are unauthenticated by necessity — IPTV players
+                  cannot send a bearer token — so the token in them is the only
+                  thing protecting the playlist. Say so, and offer a rotate. */}
+              <div className="flex items-start gap-2.5 pt-1">
+                <ShieldAlert className="h-4 w-4 mt-0.5 shrink-0 text-amber-500" />
+                <p className="flex-1 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
+                  Anyone with these links can read this playlist — including its stream URLs —
+                  without signing in. Share them only with your own players.
+                </p>
+              </div>
+              <button
+                onClick={rotateExportLink}
+                disabled={rotating}
+                className="md-btn w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-medium
+                           text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-white/6
+                           border border-gray-200 dark:border-white/10
+                           hover:bg-gray-200 dark:hover:bg-white/10 disabled:opacity-50 transition-colors"
+              >
+                <RefreshCw className={`h-4 w-4 ${rotating ? 'animate-spin' : ''}`} />
+                {rotating ? 'Generating…' : 'Generate new links'}
+              </button>
             </div>
           </div>
         </div>

@@ -10,10 +10,17 @@ export function getSessionToken(): string | null {
 
 export function setSessionToken(token: string) {
   sessionStorage.setItem(SESSION_KEY, token);
+  // AuthContext reads identity once on mount, which happens while the lock
+  // screen is up and /api/auth/me still 401s. Every path that establishes a
+  // session goes through here, so this is the one place that reliably tells it
+  // to re-read — mirroring the existing `auth-expired` event in the other
+  // direction.
+  window.dispatchEvent(new Event('auth-changed'));
 }
 
 export function clearSessionToken() {
   sessionStorage.removeItem(SESSION_KEY);
+  window.dispatchEvent(new Event('auth-changed'));
 }
 
 function authHeaders(): Record<string, string> {
@@ -59,8 +66,43 @@ export interface Playlist {
   categories: string[];
   exportId: string;
   shortId: number;
+  /** Secret for the public /e/:token export URLs. Rotatable. */
+  exportToken: string;
+  /** Bumped on every write; send back as If-Match. */
+  version: number;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface AuthStatus {
+  enabled: boolean;
+  userCount: number;
+  /** True once a second account exists, at which point login needs a username. */
+  multiUser: boolean;
+}
+
+export interface AuthUser {
+  id: string;
+  username: string;
+  isAdmin: boolean;
+}
+
+export interface Device {
+  id: string;
+  userId: string;
+  name: string;
+  createdAt: number;
+  lastSeenAt: number;
+  /** True for the browser making the request. */
+  current?: boolean;
+}
+
+export interface UserListEntry {
+  id: string;
+  username: string;
+  isAdmin: boolean;
+  createdAt: number;
+  deviceCount: number;
 }
 
 export interface Channel {
@@ -197,12 +239,31 @@ export const api = {
     authFetch(`/api/playlists/${playlistId}/channels/bulk-replace`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ search, replace, field, ...(ids ? { ids } : {}) }) }).then(r => r.json()),
 
   // Auth
-  getAuthStatus: () => fetch('/api/auth/status').then(r => r.json()),
-  login: (password: string) => fetch('/api/auth/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ password }) }).then(r => r.json().then(data => ({ ...data, ok: r.ok, status: r.status }))),
-  setPassword: (password: string, currentPassword?: string) => authFetch('/api/auth/set-password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ password, currentPassword }) }).then(r => r.json().then(data => ({ ...data, ok: r.ok, status: r.status }))),
-  recover: (recoveryKey: string, newPassword: string) => fetch('/api/auth/recover', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ recoveryKey, newPassword }) }).then(r => r.json().then(data => ({ ...data, ok: r.ok, status: r.status }))),
+  getAuthStatus: () => fetch('/api/auth/status').then(r => r.json()) as Promise<AuthStatus>,
+  // `username` is optional while only one account exists — the server falls back
+  // to it — and required once there are two. `deviceName` names this browser in
+  // the device list so it can be revoked individually.
+  login: (password: string, username?: string, deviceName?: string) =>
+    fetch('/api/auth/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ password, username, deviceName }) }).then(r => r.json().then(data => ({ ...data, ok: r.ok, status: r.status }))),
+  setPassword: (password: string, currentPassword?: string, username?: string) => authFetch('/api/auth/set-password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ password, currentPassword, username }) }).then(r => r.json().then(data => ({ ...data, ok: r.ok, status: r.status }))),
+  recover: (recoveryKey: string, newPassword: string, username?: string) => fetch('/api/auth/recover', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ recoveryKey, newPassword, username }) }).then(r => r.json().then(data => ({ ...data, ok: r.ok, status: r.status }))),
   removePassword: (currentPassword: string) => authFetch('/api/auth/remove-password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ currentPassword }) }).then(r => r.json().then(data => ({ ...data, ok: r.ok, status: r.status }))),
   logout: () => authFetch('/api/auth/logout', { method: 'POST' }),
+  getCurrentUser: () => authFetch('/api/auth/me').then(r => r.json()) as Promise<{ user: AuthUser | null; device: { id: string; name: string } | null; authDisabled?: boolean }>,
+
+  // Devices
+  getDevices: () => authFetch('/api/auth/devices').then(r => r.json()) as Promise<Device[]>,
+  revokeDevice: (id: string) => authFetch(`/api/auth/devices/${id}`, { method: 'DELETE' }).then(r => r.json()),
+
+  // Users (admin only)
+  getUsers: () => authFetch('/api/users').then(r => r.json()) as Promise<UserListEntry[]>,
+  createUser: (username: string, password: string, isAdmin = false) =>
+    authFetch('/api/users', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ username, password, isAdmin }) }).then(r => r.json().then(data => ({ ...data, ok: r.ok, status: r.status }))),
+  deleteUser: (id: string) => authFetch(`/api/users/${id}`, { method: 'DELETE' }).then(r => r.json().then(data => ({ ...data, ok: r.ok, status: r.status }))),
+
+  // Export links
+  rotateExportToken: (playlistId: string) =>
+    authFetch(`/api/playlists/${playlistId}/rotate-export-token`, { method: 'POST' }).then(r => r.json()) as Promise<{ exportToken: string }>,
 
   // EPG Sources
   getEpgSources: () => authFetch('/api/epg-sources').then(r => r.json()) as Promise<EpgSource[]>,
