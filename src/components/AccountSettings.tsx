@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { api, type Device, type UserListEntry } from '../apiClient';
+import { api, clearSessionToken, type Device, type UserListEntry } from '../apiClient';
 import { useStore, contrastText, notifyError } from '../store';
 import { useAuth } from '../contexts/AuthContext';
 import {
-  Smartphone, Users, Trash2, Copy, Check, Plus, ShieldCheck, X,
+  Smartphone, Users, Trash2, Copy, Check, Plus, ShieldCheck, X, LogOut,
 } from 'lucide-react';
 
 /**
@@ -34,8 +34,8 @@ function relativeTime(ms: number): string {
 }
 
 export default function AccountSettings() {
-  const { accentColor } = useStore();
-  const { user, authDisabled, loading: authLoading, refresh: refreshAuth } = useAuth();
+  const { accentColor, setShowSettings } = useStore();
+  const { user, authDisabled, loading: authLoading, refresh: refreshAuth, logOut } = useAuth();
 
   const [devices, setDevices] = useState<Device[] | null>(null);
   const [users, setUsers] = useState<UserListEntry[] | null>(null);
@@ -96,6 +96,27 @@ export default function AccountSettings() {
       console.error(e);
       notifyError(e, 'Failed to sign that device out.');
     }
+  };
+
+  /**
+   * Signs out and returns to the lock screen — which is also how you switch to
+   * a different account, since the lock screen is where credentials are entered.
+   *
+   * Leaves Settings so that signing back in lands on the dashboard, and fires
+   * `auth-expired` because that is the event App.tsx listens to in order to
+   * show the lock screen.
+   */
+  const signOut = async () => {
+    try {
+      await logOut();
+    } catch (e) {
+      // The token may already be dead server-side; clearing it locally is what
+      // actually matters, so carry on rather than trapping the user in.
+      console.error(e);
+    }
+    clearSessionToken();
+    setShowSettings(false);
+    window.dispatchEvent(new Event('auth-expired'));
   };
 
   const createUser = async () => {
@@ -206,6 +227,20 @@ export default function AccountSettings() {
               ))}
             </ul>
           )}
+
+          <button
+            onClick={signOut}
+            className="md-btn w-full flex items-center justify-center gap-2 px-3 py-2 mt-1 rounded-lg text-sm font-medium
+                       text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-white/6
+                       border border-gray-200 dark:border-white/10
+                       hover:bg-gray-200 dark:hover:bg-white/10 transition-colors"
+          >
+            <LogOut className="h-4 w-4" />
+            Sign out
+          </button>
+          <p className="text-xs text-gray-400 dark:text-gray-500 text-center">
+            To use a different account, sign out and sign in as them.
+          </p>
         </div>
       </section>
 
