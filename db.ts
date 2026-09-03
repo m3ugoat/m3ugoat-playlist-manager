@@ -97,6 +97,27 @@ export interface ChannelPoolEntry {
   tvgId: string | null;
 }
 
+export interface User {
+  id: string;
+  username: string;
+  passwordHash: string;
+  passwordSalt: string;
+  recoveryKeyHash: string;
+  recoveryKeySalt: string;
+  isAdmin: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** A logged-in device. `token_hash` is never exposed through the API. */
+export interface DeviceToken {
+  id: string;
+  userId: string;
+  name: string;
+  createdAt: number;
+  lastSeenAt: number;
+}
+
 export interface ChannelPoolChangeLog {
   id: string;
   sourceId: string;
@@ -200,6 +221,32 @@ db.exec(`
     renamed     TEXT NOT NULL DEFAULT '[]'
   );
 
+  CREATE TABLE IF NOT EXISTS users (
+    id                TEXT PRIMARY KEY,
+    username          TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    password_hash     TEXT NOT NULL,
+    password_salt     TEXT NOT NULL,
+    recovery_key_hash TEXT NOT NULL,
+    recovery_key_salt TEXT NOT NULL,
+    is_admin          INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+  );
+
+  -- One row per logged-in device. Only the SHA-256 of the bearer token is
+  -- stored, so a copy of this database does not yield usable credentials.
+  -- Rows are durable, which is what lets a device stay logged in across a
+  -- server restart (the old in-memory Set did not).
+  CREATE TABLE IF NOT EXISTS device_tokens (
+    id           TEXT PRIMARY KEY,
+    token_hash   TEXT NOT NULL UNIQUE,
+    user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);
   CREATE INDEX IF NOT EXISTS idx_playlists_user      ON playlists(user_id);
   CREATE INDEX IF NOT EXISTS idx_channels_playlist   ON channels(playlist_id, sort_order);
   CREATE INDEX IF NOT EXISTS idx_channels_tvg        ON channels(tvg_id);
@@ -713,6 +760,191 @@ export const poolChangeLogs = {
       .run(cutoff).changes as number;
   },
 };
+
+// ── Users and device tokens ─────────────────────────────────────────────────
+
+function rowToUser(r: Row): User {
+  return {
+    id: r.id,
+    username: r.username,
+    passwordHash: r.password_hash,
+    passwordSalt: r.password_salt,
+    recoveryKeyHash: r.recovery_key_hash,
+    recoveryKeySalt: r.recovery_key_salt,
+    isAdmin: toBool(r.is_admin),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+/** The id given to the account migrated out of data/auth.json. It matches the
+ *  `userId` already stored on pre-existing playlists, so that data belongs to
+ *  this account without needing to be rewritten. */
+export const LEGACY_USER_ID = "local-user";
+
+export const users = {
+  count(): number {
+    return (db.prepare("SELECT COUNT(*) AS n FROM users").get() as Row).n;
+  },
+  /** Auth is a no-op while this is true, matching the old "no password set" behaviour. */
+  none(): boolean {
+    return this.count() === 0;
+  },
+  all(): User[] {
+    return db.prepare("SELECT * FROM users ORDER BY created_at").all().map(rowToUser);
+  },
+  byId(id: string): User | null {
+    const r = db.prepare("SELECT * FROM users WHERE id = ?").get(id);
+    return r ? rowToUser(r as Row) : null;
+  },
+  byUsername(username: string): User | null {
+    const r = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
+    return r ? rowToUser(r as Row) : null;
+  },
+  /** Used when a login omits a username and exactly one account exists. */
+  only(): User | null {
+    const all = this.all();
+    return all.length === 1 ? all[0] : null;
+  },
+  insert(u: User): void {
+    db.prepare(
+      `INSERT INTO users
+         (id, username, password_hash, password_salt, recovery_key_hash,
+          recovery_key_salt, is_admin, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      u.id,
+      u.username,
+      u.passwordHash,
+      u.passwordSalt,
+      u.recoveryKeyHash,
+      u.recoveryKeySalt,
+      fromBool(u.isAdmin),
+      u.createdAt,
+      u.updatedAt,
+    );
+  },
+  updateCredentials(
+    id: string,
+    creds: Pick<User, "passwordHash" | "passwordSalt" | "recoveryKeyHash" | "recoveryKeySalt">,
+  ): void {
+    db.prepare(
+      `UPDATE users
+          SET password_hash = ?, password_salt = ?, recovery_key_hash = ?,
+              recovery_key_salt = ?, updated_at = ?
+        WHERE id = ?`,
+    ).run(
+      creds.passwordHash,
+      creds.passwordSalt,
+      creds.recoveryKeyHash,
+      creds.recoveryKeySalt,
+      Date.now(),
+      id,
+    );
+  },
+  delete(id: string): void {
+    // device_tokens cascade via the foreign key
+    db.prepare("DELETE FROM users WHERE id = ?").run(id);
+  },
+};
+
+export const deviceTokens = {
+  /** Resolves a presented bearer token. Callers pass the SHA-256 hash, never the raw token. */
+  byTokenHash(tokenHash: string): DeviceToken | null {
+    const r = db
+      .prepare("SELECT id, user_id, name, created_at, last_seen_at FROM device_tokens WHERE token_hash = ?")
+      .get(tokenHash) as Row | undefined;
+    return r
+      ? {
+          id: r.id,
+          userId: r.user_id,
+          name: r.name,
+          createdAt: r.created_at,
+          lastSeenAt: r.last_seen_at,
+        }
+      : null;
+  },
+  insert(rec: { id: string; tokenHash: string; userId: string; name: string }): DeviceToken {
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO device_tokens (id, token_hash, user_id, name, created_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(rec.id, rec.tokenHash, rec.userId, rec.name, now, now);
+    return { id: rec.id, userId: rec.userId, name: rec.name, createdAt: now, lastSeenAt: now };
+  },
+  touch(id: string, at = Date.now()): void {
+    db.prepare("UPDATE device_tokens SET last_seen_at = ? WHERE id = ?").run(at, id);
+  },
+  listByUser(userId: string): DeviceToken[] {
+    return db
+      .prepare(
+        `SELECT id, user_id, name, created_at, last_seen_at
+           FROM device_tokens WHERE user_id = ? ORDER BY last_seen_at DESC`,
+      )
+      .all(userId)
+      .map((r: any) => ({
+        id: r.id,
+        userId: r.user_id,
+        name: r.name,
+        createdAt: r.created_at,
+        lastSeenAt: r.last_seen_at,
+      }));
+  },
+  /** Revokes one device. Scoped by user so a token can only revoke its own account's devices. */
+  revoke(id: string, userId: string): boolean {
+    return (
+      (db.prepare("DELETE FROM device_tokens WHERE id = ? AND user_id = ?").run(id, userId)
+        .changes as number) > 0
+    );
+  },
+  revokeByTokenHash(tokenHash: string): void {
+    db.prepare("DELETE FROM device_tokens WHERE token_hash = ?").run(tokenHash);
+  },
+  revokeAllForUser(userId: string): number {
+    return db.prepare("DELETE FROM device_tokens WHERE user_id = ?").run(userId)
+      .changes as number;
+  },
+};
+
+// ── One-time migration from data/auth.json ──────────────────────────────────
+
+export const LEGACY_AUTH_PATH =
+  process.env.M3U4ME_LEGACY_AUTH || path.join(DATA_DIR, "auth.json");
+
+/**
+ * Turns the old single global password (data/auth.json) into the first user
+ * account, reusing the existing PBKDF2 hashes so the same password keeps
+ * working. Runs only when no users exist yet, so it is safe to call on every
+ * boot. The JSON file is left in place as a rollback copy.
+ */
+export function migrateFromAuthJson(): { migrated: boolean; username?: string } {
+  if (users.count() > 0) return { migrated: false };
+  if (!fs.existsSync(LEGACY_AUTH_PATH)) return { migrated: false };
+
+  let auth: any;
+  try {
+    auth = JSON.parse(fs.readFileSync(LEGACY_AUTH_PATH, "utf-8"));
+  } catch (err) {
+    console.error("Could not parse data/auth.json; skipping auth migration.", err);
+    return { migrated: false };
+  }
+  if (!auth?.passwordHash || !auth?.passwordSalt) return { migrated: false };
+
+  const now = Date.now();
+  users.insert({
+    id: LEGACY_USER_ID,
+    username: "admin",
+    passwordHash: auth.passwordHash,
+    passwordSalt: auth.passwordSalt,
+    // A pre-users install always had a recovery key, but tolerate its absence.
+    recoveryKeyHash: auth.recoveryKeyHash ?? "",
+    recoveryKeySalt: auth.recoveryKeySalt ?? "",
+    isAdmin: true,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return { migrated: true, username: "admin" };
+}
 
 // ── One-time migration from data/db.json ────────────────────────────────────
 

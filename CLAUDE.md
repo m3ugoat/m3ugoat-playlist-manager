@@ -14,7 +14,8 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 - `npm run preview` — `vite preview`.
 - `npm run lint` — `eslint . && tsc --noEmit`. This is also the typecheck command; there's no separate `typecheck` script.
 - `npm run clean` — `rm -rf dist`.
-- `npm run verify:migration` — checks the `data/db.json` → SQLite import is lossless, against a throwaway database. No general test runner is configured.
+- `npm run verify:migration` — checks the `data/db.json` → SQLite import is lossless, against a throwaway database.
+- `npm run verify:auth` — end-to-end account/device-token checks; boots a real server on port 8123 against a throwaway database. No general test runner is configured.
 - Production process management is PM2 via `ecosystem.config.cjs` (`pm2 start ecosystem.config.cjs`).
 
 ## Architecture
@@ -41,7 +42,12 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 
 ### Auth is bespoke — and unrelated to `AuthContext`
 
-- Real auth: PBKDF2-hashed password + a one-time-shown recovery key, both in `data/auth.json`. Login issues a random token held only in an in-memory `Set` (`activeSessions`) — sessions do not survive a server restart. The middleware mounted at `app.use('/api', ...)` gates every `/api/*` route except `publicPaths` (`/auth/status`, `/auth/login`, `/auth/recover`). If no password has ever been set, auth is a complete no-op.
+- Real auth: per-user accounts in the `users` table (PBKDF2 password + a one-time-shown recovery key, `is_admin` flag). Login issues a random bearer token and stores **only its SHA-256** in `device_tokens`, one row per device — so tokens are durable across restarts, revocable individually, and a copy of the database yields no usable credential. The middleware at `app.use('/api', ...)` resolves the token to a device + user, populates `req.user`/`req.device` (declared via a `declare global` augmentation in `server.ts`), touches `last_seen_at`, and gates every `/api/*` route except `publicPaths` (`/auth/status`, `/auth/login`, `/auth/recover`). `requireAdmin` gates the `/api/users` routes. **If no account exists, auth is a complete no-op** — unchanged from before.
+- Password/recovery-key comparison goes through `crypto.timingSafeEqual` (`safeEqualHex`), not `!==`.
+- `username` is optional on `login`/`recover`: with exactly one account it falls back to that account (which is what the current web UI relies on), and becomes required once a second account exists.
+- `remove-password` deletes the sole account to turn auth off again, and is **refused with 409 when more than one account exists** — dropping auth would otherwise expose every account's data on the LAN.
+- Changing a password or using a recovery key revokes all of that user's device tokens (the caller's own device is re-issued so it stays signed in). Neither touches other accounts.
+- The old store was a single global password in `data/auth.json` with an in-memory `activeSessions` Set. `db.ts`'s `migrateFromAuthJson()` converts it into the first account on boot, **reusing the existing PBKDF2 hashes so the same password keeps working**, with id `LEGACY_USER_ID` (`"local-user"`) so pre-existing playlists already belong to it. `M3U4ME_LEGACY_AUTH` overrides the path for tests.
 - The frontend stores the token in `sessionStorage` (`src/apiClient.ts`: `getSessionToken`/`setSessionToken`) and routes every call through `authFetch()`, which attaches `Authorization: Bearer …` and fires a global `auth-expired` window event on a 401 (handled in `App.tsx` to re-lock the UI via `LockScreen`).
 - `src/contexts/AuthContext.tsx` (`useAuth()`) is a **vestigial, unrelated stub** — it always returns a hardcoded dummy local user and has no connection to the password system above. Don't conflate the two when touching auth.
 - The short playlist/EPG URLs (`GET /:shortId`, `GET /:shortId/epg`) are registered outside the `/api` prefix and are therefore never auth-gated — intentional, since IPTV players/EPG grabbers hitting these can't supply a bearer token.

@@ -14,7 +14,20 @@ import type {
   ChannelPoolSource,
   ChannelPoolEntry,
   ChannelPoolChangeLog,
+  User,
+  DeviceToken,
 } from "./db.ts";
+
+// The auth middleware resolves the bearer token once and hangs the result here
+// so every downstream handler can read the caller's identity.
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+      device?: DeviceToken;
+    }
+  }
+}
 const DATA_DIR = path.join(process.cwd(), "data");
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -424,34 +437,58 @@ async function refreshChannelPoolSourcesSequentially(sourceIds: string[]) {
 }
 
 // ── Auth helpers ─────────────────────────────────────────────────────────
-const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
 const PBKDF2_ITERATIONS = 100_000;
 const PBKDF2_KEYLEN = 64;
 const PBKDF2_DIGEST = 'sha512';
 
-interface AuthData {
-  passwordHash: string;  // hex
-  passwordSalt: string;  // hex
-  recoveryKeyHash: string;  // hex
-  recoveryKeySalt: string;  // hex
+// Accounts and device tokens live in SQLite (see db.ts). Previously there was a
+// single global password in data/auth.json plus an in-memory Set of session
+// tokens, which meant every device was logged out whenever the server
+// restarted. Tokens are now persisted (as hashes) so a device stays logged in.
+const authMigration = store.migrateFromAuthJson();
+if (authMigration.migrated) {
+  console.log(`Migrated data/auth.json into the users table as "${authMigration.username}".`);
 }
 
-const activeSessions = new Set<string>();
-
-function readAuth(): AuthData | null {
-  try {
-    if (!fs.existsSync(AUTH_FILE)) return null;
-    return JSON.parse(fs.readFileSync(AUTH_FILE, 'utf-8'));
-  } catch { return null; }
+/** Bearer tokens are stored only as SHA-256, so the database holds no usable credential. */
+function hashToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-function writeAuth(data: AuthData) {
-  fs.writeFileSync(AUTH_FILE, JSON.stringify(data, null, 2));
+/** Length-safe constant-time compare for hex digests. */
+function safeEqualHex(a: string, b: string): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length || a.length === 0) {
+    return false;
+  }
+  return crypto.timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
 }
 
-function deleteAuth() {
-  if (fs.existsSync(AUTH_FILE)) fs.unlinkSync(AUTH_FILE);
-  activeSessions.clear();
+async function verifyPassword(password: string, hash: string, salt: string): Promise<boolean> {
+  if (!hash || !salt) return false;
+  const { hash: candidate } = await hashPassword(password, salt);
+  return safeEqualHex(candidate, hash);
+}
+
+/** Builds a fresh password + recovery-key credential set for a user. */
+async function buildCredentials(password: string) {
+  const { hash: passwordHash, salt: passwordSalt } = await hashPassword(password);
+  const recoveryKey = generateRecoveryKey();
+  const { hash: recoveryKeyHash, salt: recoveryKeySalt } = await hashPassword(recoveryKey);
+  return { passwordHash, passwordSalt, recoveryKeyHash, recoveryKeySalt, recoveryKey };
+}
+
+/** Issues a device token and returns the raw value — the only time it exists in plaintext. */
+function issueDeviceToken(userId: string, deviceName?: unknown) {
+  const token = generateToken();
+  const name =
+    typeof deviceName === 'string' && deviceName.trim() ? deviceName.trim().slice(0, 100) : 'Unnamed device';
+  const device = store.deviceTokens.insert({
+    id: uuidv4(),
+    tokenHash: hashToken(token),
+    userId,
+    name,
+  });
+  return { token, device };
 }
 
 function hashPassword(password: string, salt?: string): Promise<{ hash: string; salt: string }> {
@@ -588,127 +625,298 @@ async function startServer() {
   }, 5 * 60 * 1000);
 
   // ── Auth middleware ──────────────────────────────────────────────────
+  // Resolves the bearer token to a device + user and hangs them off the request,
+  // so route handlers (and the per-user scoping in the next phase) have an
+  // identity to work with. When no account exists at all, auth stays a complete
+  // no-op — same as the old "no password set" behaviour.
   const publicPaths = ['/auth/status', '/auth/login', '/auth/recover'];
   app.use('/api', (req, res, next) => {
-    // Skip auth for public auth endpoints
     if (publicPaths.includes(req.path)) return next();
-    // Skip auth for M3U serving endpoints handled outside /api
-    const auth = readAuth();
-    if (!auth) return next(); // No password set — allow all
+    if (store.users.none()) return next(); // No account set up — allow all
+
     const header = req.headers.authorization;
     if (!header || !header.startsWith('Bearer ')) {
       return res.status(401).json({ error: 'Authentication required' });
     }
-    const token = header.slice(7);
-    if (!activeSessions.has(token)) {
+    const device = store.deviceTokens.byTokenHash(hashToken(header.slice(7)));
+    if (!device) {
       return res.status(401).json({ error: 'Invalid or expired session' });
     }
+    const user = store.users.byId(device.userId);
+    if (!user) {
+      // The account was deleted while this device still held a token.
+      return res.status(401).json({ error: 'Invalid or expired session' });
+    }
+    // Cheap in SQLite, and gives the device list a meaningful "last seen".
+    store.deviceTokens.touch(device.id);
+    req.user = user;
+    req.device = device;
     next();
   });
 
+  /** Routes that only an admin may call. */
+  const requireAdmin = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    // With no accounts at all the API is unauthenticated anyway, so there is
+    // nothing to gate; once accounts exist, req.user is always populated here.
+    if (store.users.none()) return next();
+    if (!req.user?.isAdmin) return res.status(403).json({ error: 'Admin privileges required' });
+    next();
+  };
+
   // ── Auth routes ────────────────────────────────────────────────────
   app.get('/api/auth/status', (_req, res) => {
-    const auth = readAuth();
-    res.json({ enabled: !!auth });
+    // `enabled` keeps its original meaning (is a login required?); the extra
+    // fields let a multi-user client decide whether to ask for a username.
+    const all = store.users.all();
+    res.json({
+      enabled: all.length > 0,
+      userCount: all.length,
+      multiUser: all.length > 1,
+    });
   });
 
   app.post('/api/auth/login', async (req, res) => {
-    const auth = readAuth();
-    if (!auth) return res.json({ token: null, message: 'No password set' });
-    const { password } = req.body;
+    if (store.users.none()) return res.json({ token: null, message: 'No password set' });
+    const { username, password, deviceName } = req.body;
     if (!password) return res.status(400).json({ error: 'Password required' });
+
+    // `username` is optional: existing single-account installs (and the current
+    // web UI) post only a password, so fall back to the sole account. Once more
+    // than one account exists a username becomes required.
+    const user = username ? store.users.byUsername(String(username)) : store.users.only();
+    if (!user) {
+      return res.status(username ? 401 : 400).json({
+        error: username ? 'Incorrect username or password' : 'Username required',
+      });
+    }
     try {
-      const { hash } = await hashPassword(password, auth.passwordSalt);
-      if (hash !== auth.passwordHash) {
-        return res.status(401).json({ error: 'Incorrect password' });
+      if (!(await verifyPassword(password, user.passwordHash, user.passwordSalt))) {
+        // Same message for a bad username and a bad password, so the response
+        // doesn't reveal which accounts exist.
+        return res.status(401).json({ error: 'Incorrect username or password' });
       }
-      const token = generateToken();
-      activeSessions.add(token);
-      res.json({ token });
+      const { token, device } = issueDeviceToken(user.id, deviceName);
+      res.json({
+        token,
+        user: { id: user.id, username: user.username, isAdmin: user.isAdmin },
+        device: { id: device.id, name: device.name },
+      });
     } catch {
       res.status(500).json({ error: 'Internal error' });
     }
   });
 
+  // Creates the first account, or changes the calling user's own password.
   app.post('/api/auth/set-password', async (req, res) => {
-    const auth = readAuth();
-    const { password, currentPassword } = req.body;
+    const { password, currentPassword, username } = req.body;
     if (!password || password.length < 4) {
       return res.status(400).json({ error: 'Password must be at least 4 characters' });
     }
-    // If a password is already set, verify the current one
-    if (auth) {
+    const firstRun = store.users.none();
+
+    try {
+      if (firstRun) {
+        // Bootstrap: the first account is an admin. Reuse the legacy id so any
+        // pre-existing playlists (userId "local-user") belong to it.
+        const creds = await buildCredentials(password);
+        const now = Date.now();
+        const desired = typeof username === 'string' && username.trim() ? username.trim() : 'admin';
+        store.users.insert({
+          id: store.LEGACY_USER_ID,
+          username: desired,
+          passwordHash: creds.passwordHash,
+          passwordSalt: creds.passwordSalt,
+          recoveryKeyHash: creds.recoveryKeyHash,
+          recoveryKeySalt: creds.recoveryKeySalt,
+          isAdmin: true,
+          createdAt: now,
+          updatedAt: now,
+        });
+        return res.json({ recoveryKey: formatRecoveryKey(creds.recoveryKey), username: desired });
+      }
+
+      // Changing an existing password requires being logged in as that user.
+      const user = req.user;
+      if (!user) return res.status(401).json({ error: 'Authentication required' });
       if (!currentPassword) return res.status(400).json({ error: 'Current password required' });
-      const { hash } = await hashPassword(currentPassword, auth.passwordSalt);
-      if (hash !== auth.passwordHash) {
+      if (!(await verifyPassword(currentPassword, user.passwordHash, user.passwordSalt))) {
         return res.status(401).json({ error: 'Current password is incorrect' });
       }
-    }
-    try {
-      const { hash: passwordHash, salt: passwordSalt } = await hashPassword(password);
-      const recoveryKey = generateRecoveryKey();
-      const { hash: recoveryKeyHash, salt: recoveryKeySalt } = await hashPassword(recoveryKey);
-      writeAuth({ passwordHash, passwordSalt, recoveryKeyHash, recoveryKeySalt });
-      res.json({ recoveryKey: formatRecoveryKey(recoveryKey) });
+
+      const creds = await buildCredentials(password);
+      store.inTransaction(() => {
+        store.users.updateCredentials(user.id, creds);
+        // Every other device holding a token from the old password is logged out;
+        // the caller's own device is re-issued below so it stays signed in.
+        store.deviceTokens.revokeAllForUser(user.id);
+      });
+      const { token } = issueDeviceToken(user.id, req.device?.name);
+      res.json({ recoveryKey: formatRecoveryKey(creds.recoveryKey), token });
     } catch {
       res.status(500).json({ error: 'Internal error' });
     }
   });
 
   app.post('/api/auth/recover', async (req, res) => {
-    const auth = readAuth();
-    if (!auth) return res.status(400).json({ error: 'No password set' });
-    const { recoveryKey, newPassword } = req.body;
+    if (store.users.none()) return res.status(400).json({ error: 'No password set' });
+    const { recoveryKey, newPassword, username } = req.body;
     if (!recoveryKey || !newPassword) {
       return res.status(400).json({ error: 'Recovery key and new password required' });
     }
     if (newPassword.length < 4) {
       return res.status(400).json({ error: 'Password must be at least 4 characters' });
     }
+    // Optional username, for the same reason as login.
+    const user = username ? store.users.byUsername(String(username)) : store.users.only();
+    if (!user) {
+      return res.status(username ? 401 : 400).json({
+        error: username ? 'Invalid recovery key' : 'Username required',
+      });
+    }
     try {
       // Strip formatting dashes from recovery key
       const cleanKey = recoveryKey.replace(/-/g, '').toUpperCase();
-      const { hash } = await hashPassword(cleanKey, auth.recoveryKeySalt);
-      if (hash !== auth.recoveryKeyHash) {
+      if (!(await verifyPassword(cleanKey, user.recoveryKeyHash, user.recoveryKeySalt))) {
         return res.status(401).json({ error: 'Invalid recovery key' });
       }
-      const { hash: passwordHash, salt: passwordSalt } = await hashPassword(newPassword);
-      const newRecoveryKey = generateRecoveryKey();
-      const { hash: recoveryKeyHash, salt: recoveryKeySalt } = await hashPassword(newRecoveryKey);
-      writeAuth({ passwordHash, passwordSalt, recoveryKeyHash, recoveryKeySalt });
-      // Clear all existing sessions
-      activeSessions.clear();
-      // Create a new session for the user
-      const token = generateToken();
-      activeSessions.add(token);
-      res.json({ token, recoveryKey: formatRecoveryKey(newRecoveryKey) });
+      const creds = await buildCredentials(newPassword);
+      store.inTransaction(() => {
+        store.users.updateCredentials(user.id, creds);
+        // A recovery means the password may have been compromised, so every
+        // device for this account is logged out.
+        store.deviceTokens.revokeAllForUser(user.id);
+      });
+      const { token } = issueDeviceToken(user.id, req.body?.deviceName);
+      res.json({ token, recoveryKey: formatRecoveryKey(creds.recoveryKey) });
     } catch {
       res.status(500).json({ error: 'Internal error' });
     }
   });
 
+  // Turns authentication off again by deleting the only account. Refused once
+  // more than one account exists: with per-user data, dropping auth would hand
+  // every account's playlists to anyone on the network.
   app.post('/api/auth/remove-password', async (req, res) => {
-    const auth = readAuth();
-    if (!auth) return res.json({ success: true });
+    if (store.users.none()) return res.json({ success: true });
+    if (store.users.count() > 1) {
+      return res.status(409).json({
+        error:
+          'Cannot disable authentication while more than one account exists. Delete the other accounts first.',
+      });
+    }
+    const user = req.user;
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
     const { currentPassword } = req.body;
     if (!currentPassword) return res.status(400).json({ error: 'Current password required' });
     try {
-      const { hash } = await hashPassword(currentPassword, auth.passwordSalt);
-      if (hash !== auth.passwordHash) {
+      if (!(await verifyPassword(currentPassword, user.passwordHash, user.passwordSalt))) {
         return res.status(401).json({ error: 'Incorrect password' });
       }
-      deleteAuth();
+      // Device tokens cascade with the user row.
+      store.users.delete(user.id);
       res.json({ success: true });
     } catch {
       res.status(500).json({ error: 'Internal error' });
     }
   });
 
-  app.post('/api/auth/logout', (_req, res) => {
-    const header = _req.headers.authorization;
+  app.post('/api/auth/logout', (req, res) => {
+    const header = req.headers.authorization;
     if (header && header.startsWith('Bearer ')) {
-      activeSessions.delete(header.slice(7));
+      // Revoking the row is what makes logout durable — the token is dead even
+      // after a restart.
+      store.deviceTokens.revokeByTokenHash(hashToken(header.slice(7)));
     }
+    res.json({ success: true });
+  });
+
+  // ── Identity, devices and accounts ──────────────────────────────────
+  app.get('/api/auth/me', (req, res) => {
+    if (!req.user) return res.json({ user: null, authDisabled: true });
+    res.json({
+      user: { id: req.user.id, username: req.user.username, isAdmin: req.user.isAdmin },
+      device: req.device ? { id: req.device.id, name: req.device.name } : null,
+    });
+  });
+
+  // The devices currently signed in to the calling account.
+  app.get('/api/auth/devices', (req, res) => {
+    if (!req.user) return res.json([]);
+    const current = req.device?.id;
+    res.json(store.deviceTokens.listByUser(req.user.id).map(d => ({ ...d, current: d.id === current })));
+  });
+
+  // Revokes one device — how you sign a lost phone or TV box out remotely.
+  app.delete('/api/auth/devices/:id', (req, res) => {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+    const removed = store.deviceTokens.revoke(req.params.id, req.user.id);
+    if (!removed) return res.status(404).json({ error: 'Device not found' });
+    res.json({ success: true });
+  });
+
+  app.get('/api/users', requireAdmin, (_req, res) => {
+    res.json(
+      store.users.all().map(u => ({
+        id: u.id,
+        username: u.username,
+        isAdmin: u.isAdmin,
+        createdAt: u.createdAt,
+        deviceCount: store.deviceTokens.listByUser(u.id).length,
+      })),
+    );
+  });
+
+  app.post('/api/users', requireAdmin, async (req, res) => {
+    const { username, password, isAdmin } = req.body;
+    if (!username || !String(username).trim()) {
+      return res.status(400).json({ error: 'Username required' });
+    }
+    if (!password || password.length < 4) {
+      return res.status(400).json({ error: 'Password must be at least 4 characters' });
+    }
+    const name = String(username).trim();
+    if (store.users.byUsername(name)) {
+      return res.status(409).json({ error: `A user named "${name}" already exists` });
+    }
+    try {
+      const creds = await buildCredentials(password);
+      const now = Date.now();
+      const id = uuidv4();
+      store.users.insert({
+        id,
+        username: name,
+        passwordHash: creds.passwordHash,
+        passwordSalt: creds.passwordSalt,
+        recoveryKeyHash: creds.recoveryKeyHash,
+        recoveryKeySalt: creds.recoveryKeySalt,
+        isAdmin: !!isAdmin,
+        createdAt: now,
+        updatedAt: now,
+      });
+      // The recovery key is shown once, here, and never stored in plaintext.
+      res.json({
+        user: { id, username: name, isAdmin: !!isAdmin },
+        recoveryKey: formatRecoveryKey(creds.recoveryKey),
+      });
+    } catch {
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  app.delete('/api/users/:id', requireAdmin, (req, res) => {
+    const target = store.users.byId(req.params.id);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (req.user && target.id === req.user.id) {
+      return res.status(400).json({
+        error: 'You cannot delete the account you are signed in with. Use remove-password instead.',
+      });
+    }
+    if (store.users.count() <= 1) {
+      return res.status(409).json({ error: 'Cannot delete the last remaining account' });
+    }
+    // Device tokens cascade. Playlists owned by this user are deliberately left
+    // in place; reassigning or deleting them is a separate decision.
+    store.users.delete(target.id);
     res.json({ success: true });
   });
 
