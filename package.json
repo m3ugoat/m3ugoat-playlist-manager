@@ -18,7 +18,8 @@
     "lint": "eslint . && tsc --noEmit",
     "verify:migration": "tsx scripts/verify-migration.ts",
     "verify:auth": "tsx scripts/verify-auth.ts",
-    "verify:scoping": "tsx scripts/verify-scoping.ts"
+    "verify:scoping": "tsx scripts/verify-scoping.ts",
+    "verify:concurrency": "tsx scripts/verify-concurrency.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

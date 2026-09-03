@@ -87,20 +87,24 @@ function compareSet(
   check(`${label} field-for-field`, mismatch === null, mismatch ?? `${original.length} records`);
 }
 
+// Fields the SQLite store adds and the legacy JSON never had, so they have no
+// counterpart to compare against:
+//   version      — introduced with optimistic concurrency, always 1 on import
+//   exportToken  — generated per playlist during the migration
+//   userId       — the source tables gained it when accounts were introduced
+// Each is asserted separately below rather than silently ignored.
+const ADDED_BY_MIGRATION = ["version", "exportToken", "userId"] as const;
+const stripAdded = (o: any) => {
+  const out = { ...o };
+  for (const k of ADDED_BY_MIGRATION) delete out[k];
+  return out;
+};
+
 // isHidden was optional in the JSON store; SQLite always materialises it as a
 // boolean, so normalise both sides before comparing.
-const normChannel = (c: any) => ({ ...c, isHidden: !!c.isHidden });
-// exportToken is generated during the migration, so it has no JSON counterpart.
-const normPlaylist = (p: any) => {
-  const { exportToken, ...rest } = p;
-  return rest;
-};
-// Likewise userId: the source tables gained it when accounts were introduced,
-// and the migration stamps the legacy account onto pre-existing rows.
-const normSource = (x: any) => {
-  const { userId, ...rest } = x;
-  return rest;
-};
+const normChannel = (c: any) => stripAdded({ ...c, isHidden: !!c.isHidden });
+const normPlaylist = (p: any) => stripAdded(p);
+const normSource = (x: any) => stripAdded(x);
 
 compareSet("playlists", json.playlists ?? [], gotPlaylists, normPlaylist);
 compareSet("channels", json.channels ?? [], gotChannels, normChannel);
@@ -112,6 +116,10 @@ compareSet("channelPoolEntries", json.channelPoolEntries ?? [], allEntries);
 check(
   "every migrated playlist got an export token",
   gotPlaylists.every((p) => typeof p.exportToken === "string" && p.exportToken.length >= 40),
+);
+check(
+  "every migrated row starts at version 1",
+  [...gotPlaylists, ...gotChannels, ...gotPoolSrc, ...gotEpg].every((x: any) => x.version === 1),
 );
 check(
   "migrated sources are owned by the legacy account",

@@ -43,6 +43,8 @@ export interface Playlist {
   shortId: number;
   /** Secret used by the public /e/:token export URLs. Rotatable. */
   exportToken: string;
+  /** Bumped on every write. Clients pass it back as If-Match; see WriteResult. */
+  version: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -57,6 +59,7 @@ export interface Channel {
   category: string;
   order: number;
   isHidden?: boolean;
+  version: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -72,6 +75,7 @@ export interface EpgSource {
   lastFetched: number | null;
   lastFetchError: string | null;
   channelCount: number;
+  version: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -87,6 +91,7 @@ export interface ChannelPoolSource {
   lastFetched: number | null;
   lastFetchError: string | null;
   channelCount: number;
+  version: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -323,6 +328,7 @@ function rowToPlaylist(r: Row): Playlist {
     exportId: r.export_id,
     shortId: r.short_id,
     exportToken: r.export_token,
+    version: r.version,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -339,6 +345,7 @@ function rowToChannel(r: Row): Channel {
     category: r.category,
     order: r.sort_order,
     isHidden: toBool(r.is_hidden),
+    version: r.version,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -361,6 +368,7 @@ function rowToEpgSource(r: Row): EpgSource {
     lastFetched: r.last_fetched ?? null,
     lastFetchError: r.last_fetch_error ?? null,
     channelCount: r.channel_count,
+    version: r.version,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -380,6 +388,7 @@ function rowToPoolSource(r: Row): ChannelPoolSource {
     lastFetched: r.last_fetched ?? null,
     lastFetchError: r.last_fetch_error ?? null,
     channelCount: r.channel_count,
+    version: r.version,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -410,6 +419,62 @@ function rowToChangeLog(r: Row): ChannelPoolChangeLog {
     removed: parseJson(r.removed, []),
     renamed: parseJson(r.renamed, []),
   };
+}
+
+// ── Conditional writes ──────────────────────────────────────────────────────
+
+/**
+ * Outcome of a write that a caller may have gated on a version.
+ *
+ * `conflict` carries the current server state so the route can hand it back
+ * with the 409 — the client then has what it needs to merge without a second
+ * round trip. `notfound` and `conflict` are kept distinct because the HTTP
+ * responses differ (404 vs 409), and because collapsing them would let a
+ * caller tell a wrong version apart from a missing row only by guessing.
+ */
+/**
+ * Shape accepted by insert(): a new row has no version yet, the database
+ * defaults it to 1. Keeps `version` non-optional on reads, where callers need
+ * it for ETag/If-Match, without forcing every creation site to invent one.
+ */
+export type New<T> = Omit<T, "version">;
+
+/**
+ * The discriminant is a string rather than a boolean `ok` flag on purpose: this
+ * project's tsconfig does not enable `strict`, and without `strictNullChecks`
+ * TypeScript will not narrow a discriminated union on a boolean literal — it
+ * narrows string literals fine.
+ */
+export type WriteResult<T> =
+  | { status: "ok"; value: T }
+  | { status: "notfound" }
+  | { status: "conflict"; current: T };
+
+/**
+ * Shared body of every conditional update.
+ *
+ * The version test lives in the UPDATE's WHERE clause rather than in a
+ * separate read, so the check and the write are one atomic statement. A
+ * read-then-write would leave a window — small in one process, real across
+ * two — where another writer lands in between.
+ */
+function conditionalUpdate<T extends { version: number }>(
+  load: () => T | null,
+  expectedVersion: number | undefined,
+  run: (expected: number) => number,
+): WriteResult<T> {
+  const current = load();
+  if (!current) return { status: "notfound" };
+  // No precondition given: apply to whatever the current version is. RFC 9110
+  // treats a missing If-Match as "no precondition", and the web UI sends none.
+  const expected = expectedVersion ?? current.version;
+  if (run(expected) === 0) {
+    // The row exists (we just loaded it), so a zero-row update means the
+    // version moved under us.
+    return { status: "conflict", current: load() ?? current };
+  }
+  const updated = load();
+  return updated ? { status: "ok", value: updated } : { status: "notfound" };
 }
 
 // ── Transactions ────────────────────────────────────────────────────────────
@@ -478,7 +543,7 @@ export const playlists = {
     const r = db.prepare("SELECT COALESCE(MAX(short_id), 0) + 1 AS next FROM playlists").get() as Row;
     return r.next;
   },
-  insert(p: Playlist): void {
+  insert(p: New<Playlist>): void {
     db.prepare(
       `INSERT INTO playlists
          (id, user_id, name, categories, export_id, short_id, export_token, created_at, updated_at)
@@ -495,16 +560,28 @@ export const playlists = {
       p.updatedAt,
     );
   },
-  update(id: string, userId: string, patch: Partial<Playlist>): Playlist | null {
-    const current = this.byId(id, userId);
-    if (!current) return null;
-    const next = { ...current, ...patch, updatedAt: Date.now() };
-    db.prepare(
-      `UPDATE playlists
-          SET name = ?, categories = ?, updated_at = ?, version = version + 1
-        WHERE id = ? AND user_id = ?`,
-    ).run(next.name, JSON.stringify(next.categories ?? []), next.updatedAt, id, userId);
-    return next;
+  update(
+    id: string,
+    userId: string,
+    patch: Partial<Playlist>,
+    expectedVersion?: number,
+  ): WriteResult<Playlist> {
+    return conditionalUpdate(
+      () => this.byId(id, userId),
+      expectedVersion,
+      (expected) => {
+        const current = this.byId(id, userId)!;
+        const next = { ...current, ...patch, updatedAt: Date.now() };
+        return db
+          .prepare(
+            `UPDATE playlists
+                SET name = ?, categories = ?, updated_at = ?, version = version + 1
+              WHERE id = ? AND user_id = ? AND version = ?`,
+          )
+          .run(next.name, JSON.stringify(next.categories ?? []), next.updatedAt, id, userId, expected)
+          .changes as number;
+      },
+    );
   },
   /** Invalidates any export link already handed out for this playlist. */
   rotateExportToken(id: string, userId: string): string | null {
@@ -516,12 +593,19 @@ export const playlists = {
       .run(token, Date.now(), id, userId).changes as number;
     return changed > 0 ? token : null;
   },
-  delete(id: string, userId: string): boolean {
+  delete(id: string, userId: string, expectedVersion?: number): WriteResult<Playlist> {
+    const current = this.byId(id, userId);
+    if (!current) return { status: "notfound" };
+    if (expectedVersion !== undefined && current.version !== expectedVersion) {
+      return { status: "conflict", current };
+    }
     // channels cascade via the foreign key
-    return (
-      (db.prepare("DELETE FROM playlists WHERE id = ? AND user_id = ?").run(id, userId)
-        .changes as number) > 0
-    );
+    const changed = db
+      .prepare("DELETE FROM playlists WHERE id = ? AND user_id = ? AND version = ?")
+      .run(id, userId, current.version).changes as number;
+    return changed > 0
+      ? { status: "ok", value: current }
+      : { status: "conflict", current: this.byId(id, userId) ?? current };
   },
 };
 
@@ -584,7 +668,7 @@ export const channels = {
       .get(playlistId) as Row;
     return r.n;
   },
-  insert(c: Channel): void {
+  insert(c: New<Channel>): void {
     db.prepare(
       `INSERT INTO channels
          (id, playlist_id, name, url, logo, tvg_id, category, sort_order, is_hidden, created_at, updated_at)
@@ -603,7 +687,7 @@ export const channels = {
       c.updatedAt,
     );
   },
-  insertMany(list: Channel[]): void {
+  insertMany(list: New<Channel>[]): void {
     const stmt = db.prepare(
       `INSERT INTO channels
          (id, playlist_id, name, url, logo, tvg_id, category, sort_order, is_hidden, created_at, updated_at)
@@ -625,43 +709,66 @@ export const channels = {
       );
     }
   },
-  update(id: string, userId: string, patch: Partial<Channel>): Channel | null {
-    const current = this.byId(id, userId);
-    if (!current) return null;
-    const next = { ...current, ...patch, updatedAt: Date.now() };
-    db.prepare(
-      `UPDATE channels
-          SET name = ?, url = ?, logo = ?, tvg_id = ?, category = ?,
-              sort_order = ?, is_hidden = ?, updated_at = ?, version = version + 1
-        WHERE id = ?`,
-    ).run(
-      next.name,
-      next.url,
-      next.logo ?? null,
-      next.tvgId ?? null,
-      next.category,
-      next.order,
-      fromBool(next.isHidden),
-      next.updatedAt,
-      id,
+  update(
+    id: string,
+    userId: string,
+    patch: Partial<Channel>,
+    expectedVersion?: number,
+  ): WriteResult<Channel> {
+    return conditionalUpdate(
+      () => this.byId(id, userId),
+      expectedVersion,
+      (expected) => {
+        const current = this.byId(id, userId)!;
+        const next = { ...current, ...patch, updatedAt: Date.now() };
+        return db
+          .prepare(
+            `UPDATE channels
+                SET name = ?, url = ?, logo = ?, tvg_id = ?, category = ?,
+                    sort_order = ?, is_hidden = ?, updated_at = ?, version = version + 1
+              WHERE id = ? AND version = ?`,
+          )
+          .run(
+            next.name,
+            next.url,
+            next.logo ?? null,
+            next.tvgId ?? null,
+            next.category,
+            next.order,
+            fromBool(next.isHidden),
+            next.updatedAt,
+            id,
+            expected,
+          ).changes as number;
+      },
     );
-    return next;
+  },
+  /** Unconditional variant for the bulk routes, which have no single version. */
+  updateUnconditional(id: string, userId: string, patch: Partial<Channel>): Channel | null {
+    const r = this.update(id, userId, patch);
+    return r.status === "ok" ? r.value : null;
   },
   setOrder(id: string, order: number, updatedAt = Date.now()): void {
     db.prepare(
       "UPDATE channels SET sort_order = ?, updated_at = ?, version = version + 1 WHERE id = ?",
     ).run(order, updatedAt, id);
   },
-  delete(id: string, userId: string): boolean {
-    return (
-      (db
-        .prepare(
-          `DELETE FROM channels
-             WHERE id = ?
-               AND playlist_id IN (SELECT id FROM playlists WHERE user_id = ?)`,
-        )
-        .run(id, userId).changes as number) > 0
-    );
+  delete(id: string, userId: string, expectedVersion?: number): WriteResult<Channel> {
+    const current = this.byId(id, userId);
+    if (!current) return { status: "notfound" };
+    if (expectedVersion !== undefined && current.version !== expectedVersion) {
+      return { status: "conflict", current };
+    }
+    const changed = db
+      .prepare(
+        `DELETE FROM channels
+           WHERE id = ? AND version = ?
+             AND playlist_id IN (SELECT id FROM playlists WHERE user_id = ?)`,
+      )
+      .run(id, current.version, userId).changes as number;
+    return changed > 0
+      ? { status: "ok", value: current }
+      : { status: "conflict", current: this.byId(id, userId) ?? current };
   },
   deleteMany(ids: string[], userId: string): number {
     if (ids.length === 0) return 0;
@@ -711,7 +818,7 @@ export const epgSources = {
     const r = db.prepare("SELECT * FROM epg_sources WHERE id = ?").get(id);
     return r ? rowToEpgSource(r as Row) : null;
   },
-  insert(s: EpgSource): void {
+  insert(s: New<EpgSource>): void {
     db.prepare(
       `INSERT INTO epg_sources
          (id, user_id, name, url, type, xtream_username, xtream_password, refresh_interval_hours,
@@ -733,8 +840,54 @@ export const epgSources = {
       s.updatedAt,
     );
   },
-  /** userId omitted deliberately: the refresh loop updates fetch status for any account. */
-  update(id: string, patch: Partial<EpgSource>): EpgSource | null {
+  /**
+   * Conditional, user-scoped update for API callers.
+   * The refresh loop uses updateStatus() below instead.
+   */
+  update(
+    id: string,
+    userId: string,
+    patch: Partial<EpgSource>,
+    expectedVersion?: number,
+  ): WriteResult<EpgSource> {
+    return conditionalUpdate(
+      () => this.byId(id, userId),
+      expectedVersion,
+      (expected) => {
+        const current = this.byId(id, userId)!;
+        const next = { ...current, ...patch, updatedAt: Date.now() };
+        return db
+          .prepare(
+            `UPDATE epg_sources
+                SET name = ?, url = ?, type = ?, xtream_username = ?, xtream_password = ?,
+                    refresh_interval_hours = ?, last_fetched = ?, last_fetch_error = ?,
+                    channel_count = ?, updated_at = ?, version = version + 1
+              WHERE id = ? AND user_id = ? AND version = ?`,
+          )
+          .run(
+            next.name,
+            next.url,
+            next.type,
+            next.xtreamCredentials?.username ?? null,
+            next.xtreamCredentials?.password ?? null,
+            next.refreshIntervalHours,
+            next.lastFetched ?? null,
+            next.lastFetchError ?? null,
+            next.channelCount,
+            next.updatedAt,
+            id,
+            userId,
+            expected,
+          ).changes as number;
+      },
+    );
+  },
+  /**
+   * Unconditional status write for the background refresh, which has no request
+   * user and must not fail on a version race — it only ever touches fetch
+   * bookkeeping (lastFetched / lastFetchError / channelCount).
+   */
+  updateStatus(id: string, patch: Partial<EpgSource>): EpgSource | null {
     const current = this.byIdUnscoped(id);
     if (!current) return null;
     const next = { ...current, ...patch, updatedAt: Date.now() };
@@ -759,11 +912,14 @@ export const epgSources = {
     );
     return next;
   },
-  delete(id: string, userId: string): boolean {
-    return (
-      (db.prepare("DELETE FROM epg_sources WHERE id = ? AND user_id = ?").run(id, userId)
-        .changes as number) > 0
-    );
+  delete(id: string, userId: string, expectedVersion?: number): WriteResult<EpgSource> {
+    const current = this.byId(id, userId);
+    if (!current) return { status: "notfound" };
+    if (expectedVersion !== undefined && current.version !== expectedVersion) {
+      return { status: "conflict", current };
+    }
+    db.prepare("DELETE FROM epg_sources WHERE id = ? AND user_id = ?").run(id, userId);
+    return { status: "ok", value: current };
   },
 };
 
@@ -794,7 +950,7 @@ export const poolSources = {
     const r = db.prepare("SELECT * FROM channel_pool_sources WHERE id = ?").get(id);
     return r ? rowToPoolSource(r as Row) : null;
   },
-  insert(s: ChannelPoolSource): void {
+  insert(s: New<ChannelPoolSource>): void {
     db.prepare(
       `INSERT INTO channel_pool_sources
          (id, user_id, name, type, url, xtream_username, xtream_password, refresh_interval_hours,
@@ -816,8 +972,47 @@ export const poolSources = {
       s.updatedAt,
     );
   },
-  /** userId omitted deliberately: the refresh loop updates fetch status for any account. */
-  update(id: string, patch: Partial<ChannelPoolSource>): ChannelPoolSource | null {
+  /** Conditional, user-scoped update for API callers. */
+  update(
+    id: string,
+    userId: string,
+    patch: Partial<ChannelPoolSource>,
+    expectedVersion?: number,
+  ): WriteResult<ChannelPoolSource> {
+    return conditionalUpdate(
+      () => this.byId(id, userId),
+      expectedVersion,
+      (expected) => {
+        const current = this.byId(id, userId)!;
+        const next = { ...current, ...patch, updatedAt: Date.now() };
+        return db
+          .prepare(
+            `UPDATE channel_pool_sources
+                SET name = ?, type = ?, url = ?, xtream_username = ?, xtream_password = ?,
+                    refresh_interval_hours = ?, last_fetched = ?, last_fetch_error = ?,
+                    channel_count = ?, updated_at = ?, version = version + 1
+              WHERE id = ? AND user_id = ? AND version = ?`,
+          )
+          .run(
+            next.name,
+            next.type,
+            next.url ?? null,
+            next.xtreamCredentials?.username ?? null,
+            next.xtreamCredentials?.password ?? null,
+            next.refreshIntervalHours,
+            next.lastFetched ?? null,
+            next.lastFetchError ?? null,
+            next.channelCount,
+            next.updatedAt,
+            id,
+            userId,
+            expected,
+          ).changes as number;
+      },
+    );
+  },
+  /** Unconditional status write for the background refresh. See epgSources.updateStatus. */
+  updateStatus(id: string, patch: Partial<ChannelPoolSource>): ChannelPoolSource | null {
     const current = this.byIdUnscoped(id);
     if (!current) return null;
     const next = { ...current, ...patch, updatedAt: Date.now() };
@@ -842,13 +1037,16 @@ export const poolSources = {
     );
     return next;
   },
-  delete(id: string, userId: string): boolean {
+  delete(id: string, userId: string, expectedVersion?: number): WriteResult<ChannelPoolSource> {
+    const current = this.byId(id, userId);
+    if (!current) return { status: "notfound" };
+    if (expectedVersion !== undefined && current.version !== expectedVersion) {
+      return { status: "conflict", current };
+    }
     // Entries cascade via the foreign key; changelogs are cleared explicitly by
     // the caller (see the DELETE route) to match the previous behaviour.
-    return (
-      (db.prepare("DELETE FROM channel_pool_sources WHERE id = ? AND user_id = ?").run(id, userId)
-        .changes as number) > 0
-    );
+    db.prepare("DELETE FROM channel_pool_sources WHERE id = ? AND user_id = ?").run(id, userId);
+    return { status: "ok", value: current };
   },
 };
 

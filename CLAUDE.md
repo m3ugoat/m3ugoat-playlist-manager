@@ -16,7 +16,8 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 - `npm run clean` — `rm -rf dist`.
 - `npm run verify:migration` — checks the `data/db.json` → SQLite import is lossless, against a throwaway database.
 - `npm run verify:auth` — end-to-end account/device-token checks; boots a real server on port 8123 against a throwaway database.
-- `npm run verify:scoping` — end-to-end per-user isolation and export-token checks; boots a real server on port 8126. No general test runner is configured.
+- `npm run verify:scoping` — end-to-end per-user isolation and export-token checks; boots a real server on port 8126.
+- `npm run verify:concurrency` — end-to-end If-Match/ETag/409 checks; boots a real server on port 8127. No general test runner is configured.
 - Production process management is PM2 via `ecosystem.config.cjs` (`pm2 start ecosystem.config.cjs`).
 
 ## Architecture
@@ -30,7 +31,10 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 - Channels have no `user_id` of their own; ownership comes from their playlist, so scoped channel queries join through `playlists`.
 - Cross-account access returns **404, not 403**, so a probe cannot confirm that someone else's id exists.
 - Multi-statement writes must go through `store.inTransaction(...)` so they cannot half-apply. Columns are snake_case, TypeScript objects stay camelCase, and each table has an explicit `rowTo*` mapper — no automatic name conversion.
-- Every mutable row carries a `version` column. It is incremented on write but **not yet enforced**; optimistic concurrency (`If-Match` / `ETag` / 409) is a later phase.
+- Every mutable row carries a `version` column, incremented on write and **exposed on every read** as a `version` field (list endpoints included, since there are no single-resource GETs). It is the entity tag.
+- Conditional writes go through `WriteResult<T>` — `{ status: "ok" | "notfound" | "conflict" }`. The discriminant is a **string, not a boolean `ok` flag**, because this project's tsconfig does not set `strict`: without `strictNullChecks` TypeScript will not narrow a union on a boolean literal, though it narrows string literals fine.
+- `update()`/`delete()` take an optional `expectedVersion`. The version test is in the `UPDATE`'s own `WHERE` clause, not a preceding read, so check-and-write is one atomic statement rather than a race window.
+- Two escape hatches from the conditional path, both deliberate: `epgSources.updateStatus()` / `poolSources.updateStatus()` for the background refresh (no request user, must not fail on a version race — it only writes fetch bookkeeping), and `channels.updateUnconditional()` for the bulk routes, which have no single version to gate on.
 - In-place schema changes go through `addColumnIfMissing()` near the top of `db.ts`, **not** the main `CREATE TABLE IF NOT EXISTS` batch: on a database whose tables already exist, that batch is a no-op, so anything referencing a new column (an index, especially) must run *after* the `ALTER TABLE`. Getting this order wrong fails only on upgrade, never on a fresh database — `verify:migration` covers it by opening a deliberately older-shaped database in a subprocess.
 - The previous store was a single JSON file, `data/db.json`, whose `readDb()`/`writeDb()` rewrote the whole document per mutation. `db.ts`'s `migrateFromJson()` imports it once on first boot when the database is empty, then leaves it alone as a rollback copy; `npm run verify:migration` re-checks that import field-for-field against a throwaway database. That migration also backfills `shortId`/`exportId`, which is why the old `migrateShortIds()` boot pass is gone — `short_id` is now `NOT NULL UNIQUE`.
 - Auth secrets live in a separate gitignored file, `data/auth.json`.
@@ -60,6 +64,15 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
   - `GET /e/:token/epg` — the XMLTV document.
   - `GET /:shortId` and `GET /:shortId/epg` are **disabled by default, returning 410 Gone.** `shortId` is a small incrementing integer, so with more than one account these enumerable, unauthenticated routes would expose every playlist — including stream URLs, which in IPTV routinely embed provider credentials. `ALLOW_INSECURE_SHORT_IDS=1` re-enables them (with a startup warning) for a migration window while players are repointed.
   - `serveEpgXml()` filters the global `epgCache` to the playlist owner's EPG sources, so a shared tvg-id can't pull another account's programme data into the document.
+
+### Optimistic concurrency (the sync contract)
+
+- Clients read a resource, take its `version`, and send it back on the next write as `If-Match`. A successful write returns the new version in an `ETag` header.
+- A stale version gets **409** with `{ error, currentVersion, current }` — the body carries the current server state so the client can merge and retry without a second round trip. The 409 also sets `ETag` to the current version.
+- **`If-Match` is optional.** RFC 9110 treats a missing precondition as "no precondition", and the existing web UI sends none, so omitting it means last-write-wins. A sync client SHOULD always send it.
+- Accepted header forms: `3`, `"3"`, `W/"3"`. `*` means no precondition. Anything else is **400** — distinct from 409, so a client can tell a bug from a conflict.
+- **404 beats 409**: a missing resource is 404 even with `If-Match`.
+- The bulk routes (`bulk-update`, `bulk-update-many`, `bulk-replace`, `bulk-delete`, `reorder`) do **not** support `If-Match` — they span many rows with independent versions. They remain last-write-wins; a sync client that needs per-record safety should use the single-resource routes.
 
 ### Frontend data flow: no query library — hand-rolled fetch + event bus
 

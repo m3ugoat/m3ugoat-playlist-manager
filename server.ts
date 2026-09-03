@@ -147,7 +147,7 @@ async function refreshEpgSource(sourceId: string) {
     const data = await fetchAndParseEpg(source);
     epgCache.set(sourceId, { ...data, fetchedAt: Date.now() });
 
-    store.epgSources.update(sourceId, {
+    store.epgSources.updateStatus(sourceId, {
       lastFetched: Date.now(),
       channelCount: data.channels.length,
       lastFetchError: null,
@@ -155,7 +155,7 @@ async function refreshEpgSource(sourceId: string) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Failed to refresh EPG source ${source.name}:`, err);
-    store.epgSources.update(sourceId, { lastFetchError: message });
+    store.epgSources.updateStatus(sourceId, { lastFetchError: message });
   }
 }
 
@@ -413,7 +413,7 @@ async function refreshChannelPoolSource(sourceId: string): Promise<boolean> {
     const changed = detectChannelPoolChanges(sourceId, newEntries);
     channelPoolCache.set(sourceId, newEntries);
 
-    store.poolSources.update(sourceId, {
+    store.poolSources.updateStatus(sourceId, {
       lastFetched: Date.now(),
       channelCount: newEntries.length,
       lastFetchError: null,
@@ -422,7 +422,7 @@ async function refreshChannelPoolSource(sourceId: string): Promise<boolean> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`Failed to refresh Channel Pool source ${source.name}:`, err);
-    store.poolSources.update(sourceId, { lastFetchError: message });
+    store.poolSources.updateStatus(sourceId, { lastFetchError: message });
     return false;
   }
 }
@@ -462,6 +462,71 @@ if (authMigration.migrated) {
  */
 function actingUserId(req: express.Request): string {
   return req.user?.id ?? store.LEGACY_USER_ID;
+}
+
+// ── Optimistic concurrency ──────────────────────────────────────────────────
+//
+// Clients read a resource, get its version back as an ETag, and pass it to the
+// next write as If-Match. If the stored version has moved on, the write is
+// rejected with 409 and the current server state, so the client can merge and
+// retry rather than silently overwriting whatever it did not see.
+//
+// If-Match is optional: RFC 9110 treats a missing precondition as "no
+// precondition", and the existing web UI sends none. A sync client SHOULD send
+// it — without one, last write wins.
+
+/** Parses If-Match. Returns undefined for no header or `*`, null if unusable. */
+function parseIfMatch(req: express.Request): number | undefined | null {
+  const header = req.headers['if-match'];
+  if (header === undefined) return undefined;
+  const raw = Array.isArray(header) ? header[0] : header;
+  const value = String(raw).trim();
+  if (value === '' || value === '*') return undefined;
+  // Accept both "3" and the quoted/weak forms an HTTP client may produce.
+  const match = /^(?:W\/)?"?(\d+)"?$/.exec(value);
+  if (!match) return null;
+  return Number(match[1]);
+}
+
+/** Version numbers are the entity tag. */
+const etagFor = (version: number) => `"${version}"`;
+
+/**
+ * Turns a WriteResult into a response. Returns true if it handled the request,
+ * so callers can `if (respondToWrite(...)) return;`.
+ */
+function sendWriteResult<T extends { version: number }>(
+  res: express.Response,
+  result: store.WriteResult<T>,
+  onSuccess?: (value: T) => void,
+): void {
+  if (result.status === 'ok') {
+    res.setHeader('ETag', etagFor(result.value.version));
+    onSuccess?.(result.value);
+    res.json(result.value);
+    return;
+  }
+  if (result.status === 'notfound') {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  // 409 carries the current state so the client can merge without re-fetching.
+  res.setHeader('ETag', etagFor(result.current.version));
+  res.status(409).json({
+    error: 'Version conflict: the resource changed since you last read it',
+    currentVersion: result.current.version,
+    current: result.current,
+  });
+}
+
+/** Rejects a malformed If-Match with 400. Returns the parsed version, or false if handled. */
+function ifMatchOr400(req: express.Request, res: express.Response): number | undefined | false {
+  const expected = parseIfMatch(req);
+  if (expected === null) {
+    res.status(400).json({ error: 'Malformed If-Match header; expected a version number' });
+    return false;
+  }
+  return expected;
 }
 
 /** Bearer tokens are stored only as SHA-256, so the database holds no usable credential. */
@@ -942,7 +1007,7 @@ async function startServer() {
   });
 
   app.post("/api/epg-sources", async (req, res) => {
-    const newSource: EpgSource = {
+    const newSource: store.New<EpgSource> = {
       id: uuidv4(),
       ...req.body,
       userId: actingUserId(req),
@@ -959,22 +1024,19 @@ async function startServer() {
   });
 
   app.put("/api/epg-sources/:id", (req, res) => {
-    // Ownership first: an unscoped update() would otherwise edit another account's source.
-    if (!store.epgSources.byId(req.params.id, actingUserId(req))) {
-      return res.status(404).json({ error: "Not found" });
-    }
-    const updated = store.epgSources.update(req.params.id, req.body);
-    if (updated) {
-      res.json(updated);
-    } else {
-      res.status(404).json({ error: "Not found" });
-    }
+    const expected = ifMatchOr400(req, res);
+    if (expected === false) return;
+    sendWriteResult(
+      res,
+      store.epgSources.update(req.params.id, actingUserId(req), req.body, expected),
+    );
   });
 
   app.delete("/api/epg-sources/:id", (req, res) => {
-    if (!store.epgSources.delete(req.params.id, actingUserId(req))) {
-      return res.status(404).json({ error: "Not found" });
-    }
+    const expected = ifMatchOr400(req, res);
+    if (expected === false) return;
+    const result = store.epgSources.delete(req.params.id, actingUserId(req), expected);
+    if (result.status !== 'ok') return sendWriteResult(res, result);
     epgCache.delete(req.params.id);
     res.json({ success: true });
   });
@@ -1145,7 +1207,7 @@ async function startServer() {
   });
 
   app.post("/api/channel-pool/sources", async (req, res) => {
-    const newSource: ChannelPoolSource = {
+    const newSource: store.New<ChannelPoolSource> = {
       id: uuidv4(),
       ...req.body,
       userId: actingUserId(req),
@@ -1165,27 +1227,25 @@ async function startServer() {
   });
 
   app.put("/api/channel-pool/sources/:id", (req, res) => {
-    if (!store.poolSources.byId(req.params.id, actingUserId(req))) {
-      return res.status(404).json({ error: "Not found" });
-    }
-    const updated = store.poolSources.update(req.params.id, req.body);
-    if (updated) {
-      res.json(updated);
-    } else {
-      res.status(404).json({ error: "Not found" });
-    }
+    const expected = ifMatchOr400(req, res);
+    if (expected === false) return;
+    sendWriteResult(
+      res,
+      store.poolSources.update(req.params.id, actingUserId(req), req.body, expected),
+    );
   });
 
   app.delete("/api/channel-pool/sources/:id", (req, res) => {
+    const expected = ifMatchOr400(req, res);
+    if (expected === false) return;
     const userId = actingUserId(req);
-    if (!store.poolSources.byId(req.params.id, userId)) {
-      return res.status(404).json({ error: "Not found" });
-    }
-    store.inTransaction(() => {
+    const result = store.inTransaction(() => {
+      const r = store.poolSources.delete(req.params.id, userId, expected);
       // Entries cascade from the source row; changelogs are cleared explicitly.
-      store.poolChangeLogs.deleteBySource(req.params.id);
-      store.poolSources.delete(req.params.id, userId);
+      if (r.status === 'ok') store.poolChangeLogs.deleteBySource(req.params.id);
+      return r;
     });
+    if (result.status !== 'ok') return sendWriteResult(res, result);
     channelPoolCache.delete(req.params.id);
     res.json({ success: true });
   });
@@ -1258,7 +1318,7 @@ async function startServer() {
       return res.status(400).json({ error: "Missing name, content, or filename" });
     }
     
-    const newSource: ChannelPoolSource = {
+    const newSource: store.New<ChannelPoolSource> = {
       id: uuidv4(),
       userId: actingUserId(req),
       name,
@@ -1308,7 +1368,7 @@ async function startServer() {
   app.post("/api/playlists", (req, res) => {
     const { name } = req.body;
     const nextShortId = store.playlists.nextShortId();
-    const newPlaylist: Playlist = {
+    const newPlaylist: store.New<Playlist> = {
       id: uuidv4(),
       name: name || "Unnamed Playlist",
       userId: actingUserId(req),
@@ -1383,7 +1443,7 @@ async function startServer() {
 
     const nextShortId = store.playlists.nextShortId();
     const categories = Array.from(new Set(entries.map(e => e.category || "General")));
-    const newPlaylist: Playlist = {
+    const newPlaylist: store.New<Playlist> = {
       id: uuidv4(),
       name: String(name).trim(),
       userId: actingUserId(req),
@@ -1395,7 +1455,7 @@ async function startServer() {
       updatedAt: Date.now(),
     };
 
-    const newChannels: Channel[] = entries.map((e, i) => ({
+    const newChannels: store.New<Channel>[] = entries.map((e, i) => ({
       id: uuidv4(),
       playlistId: newPlaylist.id,
       name: e.name || "Unknown",
@@ -1436,8 +1496,9 @@ async function startServer() {
       }
       req.body.categories = trimmed;
     }
-    const updated = store.playlists.update(playlistId, userId, req.body);
-    res.json(updated);
+    const expected = ifMatchOr400(req, res);
+    if (expected === false) return;
+    sendWriteResult(res, store.playlists.update(playlistId, userId, req.body, expected));
   });
 
   // Invalidates the current /e/:token export link and issues a new one — how you
@@ -1449,10 +1510,11 @@ async function startServer() {
   });
 
   app.delete("/api/playlists/:playlistId", (req, res) => {
+    const expected = ifMatchOr400(req, res);
+    if (expected === false) return;
     // Channels are removed by the ON DELETE CASCADE on channels.playlist_id.
-    if (!store.playlists.delete(req.params.playlistId, actingUserId(req))) {
-      return res.status(404).json({ error: "Not found" });
-    }
+    const result = store.playlists.delete(req.params.playlistId, actingUserId(req), expected);
+    if (result.status !== 'ok') return sendWriteResult(res, result);
     res.json({ success: true });
   });
 
@@ -1475,7 +1537,7 @@ async function startServer() {
     // Auto increment order
     const maxOrder = store.channels.maxOrder(playlistId);
 
-    const newChannels: Channel[] = channels.map((c: any, i: number) => {
+    const newChannels: store.New<Channel>[] = channels.map((c: any, i: number) => {
       // Find category and add it to playlist if missing
       const cat = c.category || "General";
       return {
@@ -1518,18 +1580,19 @@ async function startServer() {
   });
 
   app.put("/api/playlists/:playlistId/channels/:channelId", (req, res) => {
-    const updated = store.channels.update(req.params.channelId, actingUserId(req), req.body);
-    if (updated) {
-      res.json(updated);
-    } else {
-      res.status(404).json({ error: "Not found" });
-    }
+    const expected = ifMatchOr400(req, res);
+    if (expected === false) return;
+    sendWriteResult(
+      res,
+      store.channels.update(req.params.channelId, actingUserId(req), req.body, expected),
+    );
   });
 
   app.delete("/api/playlists/:playlistId/channels/:channelId", (req, res) => {
-    if (!store.channels.delete(req.params.channelId, actingUserId(req))) {
-      return res.status(404).json({ error: "Not found" });
-    }
+    const expected = ifMatchOr400(req, res);
+    if (expected === false) return;
+    const result = store.channels.delete(req.params.channelId, actingUserId(req), expected);
+    if (result.status !== 'ok') return sendWriteResult(res, result);
     res.json({ success: true });
   });
 
@@ -1544,7 +1607,7 @@ async function startServer() {
     store.inTransaction(() => {
       const idSet = new Set<string>(ids ?? []);
       for (const c of store.channels.byPlaylist(playlistId, userId)) {
-        if (idSet.has(c.id)) store.channels.update(c.id, userId, updates);
+        if (idSet.has(c.id)) store.channels.updateUnconditional(c.id, userId, updates);
       }
 
       // Handle new category dynamic pushing
@@ -1583,7 +1646,7 @@ async function startServer() {
         if (changes.category && !categories.includes(changes.category)) {
           categories.push(changes.category);
         }
-        store.channels.update(c.id, userId, changes);
+        store.channels.updateUnconditional(c.id, userId, changes);
       }
 
       if (playlist && categories.length !== playlist.categories.length) {
@@ -1615,7 +1678,7 @@ async function startServer() {
         const updated = current.replaceAll(search, replace ?? "");
         if (updated === current) continue;
         modified++;
-        store.channels.update(c.id, userId, { [targetField]: updated } as Partial<Channel>);
+        store.channels.updateUnconditional(c.id, userId, { [targetField]: updated } as Partial<Channel>);
       }
     });
 
