@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { api, clearSessionToken, type Device, type UserListEntry } from '../apiClient';
 import { useStore, contrastText, notifyError } from '../store';
 import { useAuth } from '../contexts/AuthContext';
@@ -34,7 +35,8 @@ function relativeTime(ms: number): string {
 }
 
 export default function AccountSettings() {
-  const { accentColor, setShowSettings } = useStore();
+  const { accentColor } = useStore();
+  const navigate = useNavigate();
   const { user, authDisabled, loading: authLoading, refresh: refreshAuth, logOut } = useAuth();
 
   const [devices, setDevices] = useState<Device[] | null>(null);
@@ -102,9 +104,10 @@ export default function AccountSettings() {
    * Signs out and returns to the lock screen — which is also how you switch to
    * a different account, since the lock screen is where credentials are entered.
    *
-   * Leaves Settings so that signing back in lands on the dashboard, and fires
-   * `auth-expired` because that is the event App.tsx listens to in order to
-   * show the lock screen.
+   * Navigates away from /settings first, so that signing back in lands on the
+   * playlists page rather than dropping straight back into settings, then fires
+   * `auth-expired` — the event App.tsx listens to in order to show the lock
+   * screen.
    */
   const signOut = async () => {
     try {
@@ -115,7 +118,7 @@ export default function AccountSettings() {
       console.error(e);
     }
     clearSessionToken();
-    setShowSettings(false);
+    navigate('/playlists');
     window.dispatchEvent(new Event('auth-expired'));
   };
 
