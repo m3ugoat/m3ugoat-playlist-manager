@@ -15,6 +15,10 @@ dist-ssr/
 # Editor/AI config
 .claude/
 
+# IDE
+.idea/
+.vscode/
+
 # Ignore the live database, auth secrets, and any backups/exports of them
 data/*.json
 data/backups/
