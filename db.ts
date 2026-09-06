@@ -27,10 +27,24 @@ const DATA_DIR = path.join(process.cwd(), "data");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // Both paths can be overridden so tests and one-off checks can run against a
-// throwaway database instead of the live one.
-export const DB_PATH = process.env.M3U4ME_DB_PATH || path.join(DATA_DIR, "m3u4me.db");
+// throwaway database instead of the live one. The M3U4ME_* names are the
+// pre-rename spelling, still accepted so existing deployments keep working.
+export const DB_PATH =
+  process.env.M3UGOAT_DB_PATH || process.env.M3U4ME_DB_PATH || path.join(DATA_DIR, "m3ugoat.db");
 export const LEGACY_JSON_PATH =
-  process.env.M3U4ME_LEGACY_JSON || path.join(DATA_DIR, "db.json");
+  process.env.M3UGOAT_LEGACY_JSON || process.env.M3U4ME_LEGACY_JSON || path.join(DATA_DIR, "db.json");
+
+// The database was called m3u4me.db before the project was renamed. Move it
+// rather than silently starting from an empty one, which would look to the user
+// like every playlist had vanished. Only fires when the old file exists and the
+// new one does not, so it cannot clobber a real database.
+const PRE_RENAME_DB = path.join(DATA_DIR, "m3u4me.db");
+if (DB_PATH === path.join(DATA_DIR, "m3ugoat.db") && !fs.existsSync(DB_PATH) && fs.existsSync(PRE_RENAME_DB)) {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    if (fs.existsSync(PRE_RENAME_DB + suffix)) fs.renameSync(PRE_RENAME_DB + suffix, DB_PATH + suffix);
+  }
+  console.log("Renamed data/m3u4me.db to data/m3ugoat.db (project rename).");
+}
 
 // ── Types (shared with server.ts; frontend copy lives in src/apiClient.ts) ──
 
@@ -1294,7 +1308,7 @@ export const deviceTokens = {
 // ── One-time migration from data/auth.json ──────────────────────────────────
 
 export const LEGACY_AUTH_PATH =
-  process.env.M3U4ME_LEGACY_AUTH || path.join(DATA_DIR, "auth.json");
+  process.env.M3UGOAT_LEGACY_AUTH || process.env.M3U4ME_LEGACY_AUTH || path.join(DATA_DIR, "auth.json");
 
 /**
  * Turns the old single global password (data/auth.json) into the first user

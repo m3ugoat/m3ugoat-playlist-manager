@@ -187,7 +187,7 @@ export default function Dashboard({ activeView }: { activeView: 'playlists' | 'c
       {versionInfo.updateAvailable && !updateDismissed && versionInfo.releaseUrl && (
         <div className="shrink-0 z-30 flex items-center justify-center gap-3 px-4 py-2 text-sm font-medium text-white" style={{ backgroundColor: accentColor }}>
           <ArrowUpCircle className="h-4 w-4 shrink-0" />
-          <span>A new version of m3u4me is available: <strong>v{versionInfo.latest}</strong></span>
+          <span>A new version of m3ugoat is available: <strong>v{versionInfo.latest}</strong></span>
           <a
             href={versionInfo.releaseUrl}
             target="_blank"
@@ -220,7 +220,7 @@ export default function Dashboard({ activeView }: { activeView: 'playlists' | 'c
           </button>
 
           <div className="flex items-center ml-2 shrink-0">
-            <Logo className="h-6 w-auto text-gray-900 dark:text-white shrink-0" />
+            <Logo className="h-8 w-auto text-gray-900 dark:text-white shrink-0" />
           </div>
         </div>
 

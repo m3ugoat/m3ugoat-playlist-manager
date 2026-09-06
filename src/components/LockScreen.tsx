@@ -224,7 +224,7 @@ export default function LockScreen({ onUnlock }: LockScreenProps) {
       <div className="w-full max-w-sm bg-white dark:bg-[#272727] amoled:dark:bg-[#1a1a1a] rounded-lg elev-24 overflow-hidden">
         <div className="px-6 pt-8 pb-4 flex flex-col items-center">
           <div className="px-5 py-3 rounded-lg mb-5">
-            <Logo className="h-7 w-auto text-gray-900 dark:text-white" />
+            <Logo className="h-9 w-auto text-gray-900 dark:text-white" />
           </div>
           <div className="mx-auto w-10 h-10 rounded-full flex items-center justify-center mb-3" style={{ backgroundColor: accentColor + '18' }}>
             <Lock className="h-5 w-5" style={{ color: accentColor }} />

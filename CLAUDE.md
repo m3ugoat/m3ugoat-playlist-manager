@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. Playlists/channels never leave the box it runs on. Express backend + Vite-built React 19 frontend, persisted to a single JSON file on disk. Per the README, the codebase is AI-generated with the maintainer (a non-developer) reviewing/steering — keep changes readable and avoid introducing patterns that need heavy explanation. There is no test suite in this repo.
+m3ugoat — a **fork of [m3u4me](https://github.com/andrei-savin/m3u4me)** by @andrei-savin, adding multi-user accounts, a documented sync API and a SQLite store. `upstream` points at the original repo and its push URL is deliberately disabled; `origin` is the fork. A self-hosted, single-user, local-network IPTV M3U playlist manager. Playlists/channels never leave the box it runs on. Express backend + Vite-built React 19 frontend, persisted to a single JSON file on disk. Per the README, the codebase is AI-generated with the maintainer (a non-developer) reviewing/steering — keep changes readable and avoid introducing patterns that need heavy explanation. There is no test suite in this repo.
+
+## Project identity
+
+- The app is **m3ugoat**; the logo in `src/components/Logo.tsx` is still the inherited **m3u4me** wordmark, because it is hand-drawn SVG path data and replacing it is a design job, not a rename. Don't try to edit the path data.
+- `README.md` credits upstream and explains the fork's additions. Keep the fork framing if you touch it — the licence is GPL-3.0 and the original design is @andrei-savin's work.
 
 ## Commands
 
@@ -27,7 +32,7 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 ### One backend file, one SQLite database
 
 - `server.ts` is the entire backend — a single Express app with every route registered inline inside `startServer()`. No router modules, no ORM.
-- Persistence is SQLite via Node's built-in `node:sqlite` (no dependency), in `db.ts`. That file owns the schema, the row mappers, a plain-function repository per entity (`store.playlists`, `store.channels`, `store.epgSources`, `store.poolSources`, `store.poolEntries`, `store.poolChangeLogs`) and `inTransaction()`. The database lives at `data/m3u4me.db` (gitignored, WAL mode). `M3U4ME_DB_PATH` overrides the path for tests.
+- Persistence is SQLite via Node's built-in `node:sqlite` (no dependency), in `db.ts`. That file owns the schema, the row mappers, a plain-function repository per entity (`store.playlists`, `store.channels`, `store.epgSources`, `store.poolSources`, `store.poolEntries`, `store.poolChangeLogs`) and `inTransaction()`. The database lives at `data/m3u4me.db` (gitignored, WAL mode). `M3UGOAT_DB_PATH` overrides the path for tests (the older `M3U4ME_*` names are still accepted). A database left at the pre-rename `data/m3u4me.db` is renamed automatically on boot, so an upgrade does not look like total data loss.
 - **Requires Node 24+** (see `engines` and `.nvmrc`) — both for `node:sqlite` and because `npm run start` runs `node server.ts` directly, relying on native TypeScript type-stripping.
 - **Every repository read and write takes the owning `userId`.** That is deliberate: a missing scope is a compile error rather than a silent cross-account leak. The handful of intentional exceptions are named `*Unscoped` (`epgSources.allUnscoped`, `poolSources.byIdUnscoped`, `playlists.byShortIdUnscoped`, …) for the background refresh loops, which run for every account and have no request user, plus `channels.byPlaylistForExport` for the public export routes. `server.ts`'s `actingUserId(req)` returns `req.user?.id ?? LEGACY_USER_ID`, so an install with auth disabled keeps working as a single-user app.
 - Channels have no `user_id` of their own; ownership comes from their playlist, so scoped channel queries join through `playlists`.
@@ -58,7 +63,7 @@ m3u4me — a self-hosted, single-user, local-network IPTV M3U playlist manager. 
 - `username` is optional on `login`/`recover`: with exactly one account it falls back to that account (which is what the current web UI relies on), and becomes required once a second account exists.
 - `remove-password` deletes the sole account to turn auth off again, and is **refused with 409 when more than one account exists** — dropping auth would otherwise expose every account's data on the LAN.
 - Changing a password or using a recovery key revokes all of that user's device tokens (the caller's own device is re-issued so it stays signed in). Neither touches other accounts.
-- The old store was a single global password in `data/auth.json` with an in-memory `activeSessions` Set. `db.ts`'s `migrateFromAuthJson()` converts it into the first account on boot, **reusing the existing PBKDF2 hashes so the same password keeps working**, with id `LEGACY_USER_ID` (`"local-user"`) so pre-existing playlists already belong to it. `M3U4ME_LEGACY_AUTH` overrides the path for tests.
+- The old store was a single global password in `data/auth.json` with an in-memory `activeSessions` Set. `db.ts`'s `migrateFromAuthJson()` converts it into the first account on boot, **reusing the existing PBKDF2 hashes so the same password keeps working**, with id `LEGACY_USER_ID` (`"local-user"`) so pre-existing playlists already belong to it. `M3UGOAT_LEGACY_AUTH` overrides the path for tests.
 - The frontend stores the token in `sessionStorage` (`src/apiClient.ts`: `getSessionToken`/`setSessionToken`) and routes every call through `authFetch()`, which attaches `Authorization: Bearer …` and fires a global `auth-expired` window event on a 401 (handled in `App.tsx` to re-lock the UI via `LockScreen`).
 - `src/contexts/AuthContext.tsx` (`useAuth()`) is now **real** — it exposes the signed-in account from `GET /api/auth/me`, for components that branch on identity (chiefly hiding admin-only UI). It used to be a stub returning a hardcoded dummy user with no connection to the password system.
 - `authDisabled` on that context is distinct from "signed out": it means no account exists at all, so no login is required and the UI should behave as a single-user app. A null `user` alone does **not** mean a login is needed.

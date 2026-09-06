@@ -1,7 +1,8 @@
 import { M3U_ICON_PATH } from '../components/Logo';
 
-// Tight bounding box of M3U_ICON_PATH is x:[0, 577.2] y:[0, 204.47] within the source logo's
-// 1155x205 viewBox (it's exactly the left half — the "m3u" glyph). Padded a bit on each side.
+// Tight bounding box of M3U_ICON_PATH is x:[0, 577.2] y:[0, 204.47] (the "m3u" glyph). This is
+// independent of the Logo component's own viewBox, which is taller since the wordmark became
+// "m3ugoat" and gained a descender — the favicon deliberately crops to just the m3u glyph.
 const VIEW_BOX = '-12 -12 601.2 228.47';
 
 /** Builds a data: URI for an SVG favicon containing just the "m3u" glyph, tinted with `accentColor`. */

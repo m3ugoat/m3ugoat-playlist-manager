@@ -1988,7 +1988,7 @@ async function startServer() {
     const ownSourceIds = new Set(store.epgSources.all(playlist.userId).map(src => src.id));
 
     res.setHeader("Content-Type", "application/xml");
-    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="m3u4me">\n`;
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="m3ugoat">\n`;
     
     for (const [sourceId, cache] of epgCache.entries()) {
       if (!ownSourceIds.has(sourceId)) continue;

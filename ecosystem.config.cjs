@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: "m3u4me",
+      name: "m3ugoat",
       script: "npm",
       args: "run start",
       env: {

@@ -3,13 +3,13 @@
 //   npm run verify:migration
 //
 // Runs against a throwaway database in the system temp directory, so it never
-// touches data/m3u4me.db. Exits non-zero if any check fails.
+// touches data/m3ugoat.db. Exits non-zero if any check fails.
 
 import fs from "fs";
 import os from "os";
 import path from "path";
 
-const legacy = process.env.M3U4ME_LEGACY_JSON || path.join(process.cwd(), "data", "db.json");
+const legacy = process.env.M3UGOAT_LEGACY_JSON || path.join(process.cwd(), "data", "db.json");
 if (!fs.existsSync(legacy)) {
   console.error(`No legacy JSON at ${legacy} — nothing to verify.`);
   process.exit(1);
@@ -17,9 +17,9 @@ if (!fs.existsSync(legacy)) {
 
 // Point the store at a scratch database before importing it, since it opens the
 // connection at module load.
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "m3u4me-verify-"));
-process.env.M3U4ME_DB_PATH = path.join(scratch, "verify.db");
-process.env.M3U4ME_LEGACY_JSON = legacy;
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "m3ugoat-verify-"));
+process.env.M3UGOAT_DB_PATH = path.join(scratch, "verify.db");
+process.env.M3UGOAT_LEGACY_JSON = legacy;
 
 const store = await import("../db.ts");
 
@@ -240,7 +240,7 @@ const probe = spawnSync(
      }));`,
   ],
   {
-    env: { ...process.env, M3U4ME_DB_PATH: legacyShaped, M3U4ME_LEGACY_JSON: path.join(scratch, "none.json") },
+    env: { ...process.env, M3UGOAT_DB_PATH: legacyShaped, M3UGOAT_LEGACY_JSON: path.join(scratch, "none.json") },
     encoding: "utf-8",
   },
 );

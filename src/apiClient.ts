@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { notifyError, AuthExpiredError } from './store';
 
 // ── Session token management ────────────────────────────────────────
-const SESSION_KEY = 'm3u4me-session-token';
+const SESSION_KEY = 'm3ugoat-session-token';
 
 export function getSessionToken(): string | null {
   return sessionStorage.getItem(SESSION_KEY);

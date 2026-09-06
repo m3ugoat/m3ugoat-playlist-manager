@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { authFetch } from '../apiClient';
 
-const GITHUB_API_LATEST = 'https://api.github.com/repos/andrei-savin/m3u4me/releases/latest';
+const GITHUB_API_LATEST = 'https://api.github.com/repos/m3ugoat/m3ugoat/releases/latest';
 
 interface VersionInfo {
   current: string;

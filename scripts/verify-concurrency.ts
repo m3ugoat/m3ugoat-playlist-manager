@@ -14,7 +14,7 @@ import path from "path";
 
 const PORT = 8127;
 const BASE = `http://localhost:${PORT}`;
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "m3u4me-conc-"));
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "m3ugoat-conc-"));
 
 let failures = 0;
 const check = (label: string, ok: boolean, detail = "") => {
@@ -29,9 +29,9 @@ async function startServer() {
     env: {
       ...process.env,
       PORT: String(PORT),
-      M3U4ME_DB_PATH: path.join(scratch, "conc.db"),
-      M3U4ME_LEGACY_JSON: path.join(scratch, "none.json"),
-      M3U4ME_LEGACY_AUTH: path.join(scratch, "none-auth.json"),
+      M3UGOAT_DB_PATH: path.join(scratch, "conc.db"),
+      M3UGOAT_LEGACY_JSON: path.join(scratch, "none.json"),
+      M3UGOAT_LEGACY_AUTH: path.join(scratch, "none-auth.json"),
     },
     stdio: "ignore",
   });

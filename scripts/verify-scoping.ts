@@ -14,7 +14,7 @@ import path from "path";
 
 const PORT = 8126;
 const BASE = `http://localhost:${PORT}`;
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "m3u4me-scope-"));
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "m3ugoat-scope-"));
 const DB = path.join(scratch, "scope-test.db");
 
 let failures = 0;
@@ -30,9 +30,9 @@ async function startServer(extraEnv: Record<string, string> = {}) {
     env: {
       ...process.env,
       PORT: String(PORT),
-      M3U4ME_DB_PATH: DB,
-      M3U4ME_LEGACY_JSON: path.join(scratch, "none.json"),
-      M3U4ME_LEGACY_AUTH: path.join(scratch, "none-auth.json"),
+      M3UGOAT_DB_PATH: DB,
+      M3UGOAT_LEGACY_JSON: path.join(scratch, "none.json"),
+      M3UGOAT_LEGACY_AUTH: path.join(scratch, "none-auth.json"),
       ...extraEnv,
     },
     stdio: "ignore",

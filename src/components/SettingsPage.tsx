@@ -39,7 +39,7 @@ export default function SettingsPage() {
   const [authStatusError, setAuthStatusError] = useState(false);
   
   const versionInfo = useVersionInfo();
-  const GITHUB_REPO = 'https://github.com/andrei-savin/m3u4me';
+  const GITHUB_REPO = 'https://github.com/m3ugoat/m3ugoat';
   const BMC_URL = 'https://www.buymeacoffee.com/savinandrei';
   const BMC_YELLOW = '#FFDD00';
 
@@ -468,7 +468,7 @@ export default function SettingsPage() {
             <div className="px-5 py-6 flex flex-col items-center text-center">
               {/* Logo */}
               <div className="mb-4">
-                <Logo className="h-10 w-auto text-gray-900 dark:text-white" />
+                <Logo className="h-12 w-auto text-gray-900 dark:text-white" />
               </div>
 
               {/* Description */}

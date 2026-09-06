@@ -1,4 +1,4 @@
-// ── OpenAPI 3.1 description of the m3u4me HTTP API ──────────────────────────
+// ── OpenAPI 3.1 description of the m3ugoat HTTP API ─────────────────────────
 //
 // This is the contract client devices code against. It is authored here as a
 // plain object rather than a .yaml file for three reasons: the repo has no YAML
@@ -201,9 +201,9 @@ function applyOperationIds<T>(doc: T): T {
 const document = {
   openapi: "3.1.0",
   info: {
-    title: "m3u4me API",
+    title: "m3ugoat API",
     version: VERSION,
-    summary: "Self-hosted, local-network IPTV playlist manager and multi-device sync API.",
+    summary: "Self-hosted, local-network IPTV playlist manager and multi-device sync API. A fork of m3u4me.",
     description: [
       "## Authentication",
       "",

@@ -1,7 +1,7 @@
 {
-  "name": "m3u4me",
+  "name": "m3ugoat",
   "version": "2.0.1",
-  "description": "A local M3U IPTV playlist manager and server",
+  "description": "A local M3U IPTV playlist manager, sync API and server",
   "author": "Open Source Contributor",
   "license": "GPL-3.0",
   "engines": {
