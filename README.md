@@ -20,7 +20,7 @@ m3ugoat is your IPTV playlists' new home. Your streams don't leave your local ne
 
 ## AI Disclosure
 
-> [!NOTE]
+> [!NOTE] by [@andrei-savin](https://github.com/andrei-savin)
 > This app's code was AI-generated, with minor interventions from me. I am a graphic designer with very limited coding knowledge; I do not support pointless usage of AI and I am fully aware of the harm it can cause. <br/><br/> m3u4me started out as something that was intended only for personal use - I am sharing it only because I believe it is an useful app which might help many other IPTV enthusiasts. <b>It will always be entirely free</b>. <br/><br/> I fully encourage any developer who comes across this app and wants to turn it into something human-made, without AI involvement. </br></br> AI was not used for <b>anything</b> else besides writing the actual code of the app.
 
 > [!NOTE]
